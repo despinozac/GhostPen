@@ -4,6 +4,8 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-10-11
+
 ### Changed
 
 - Built on Oriel 0.9.16 (the framework's Power of 10 review: script time and memory limits, storage caps, per-window bridge checks).

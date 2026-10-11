@@ -271,11 +271,33 @@ var summary_mutex: std.Io.Mutex = .init;
 var link_summary: SummaryState = .{};
 var summary_markdown: std.ArrayList(u8) = .empty;
 var summary_page_text: []u8 = &.{};
+/// `link_summary.title` and `.message` live here (owned by `gpa`): the
+/// callers' strings belong to a request's arena, which is gone by the time
+/// another request reads the state. `state` is always a literal.
+var summary_title: []u8 = &.{};
+var summary_message: []u8 = &.{};
+
+/// Replace the state, copying `title` and `message`. With `summary_mutex` held.
+fn summaryStoreLocked(state: []const u8, title: []const u8, chars: usize, message: []const u8) void {
+    const t: []u8 = gpa.dupe(u8, title) catch |err| blk: {
+        log.warn("summary: title not kept ({s})", .{@errorName(err)});
+        break :blk &.{};
+    };
+    const m: []u8 = gpa.dupe(u8, message) catch |err| blk: {
+        log.warn("summary: message not kept ({s})", .{@errorName(err)});
+        break :blk &.{};
+    };
+    gpa.free(summary_title);
+    gpa.free(summary_message);
+    summary_title = t;
+    summary_message = m;
+    link_summary = .{ .state = state, .title = t, .chars = chars, .message = m, .markdown = summary_markdown.items };
+}
 
 fn summarySet(state: []const u8, title: []const u8, chars: usize, message: []const u8) void {
     summary_mutex.lockUncancelable(io);
     defer summary_mutex.unlock(io);
-    link_summary = .{ .state = state, .title = title, .chars = chars, .message = message, .markdown = summary_markdown.items };
+    summaryStoreLocked(state, title, chars, message);
     // The live update: the accumulating markdown travels separately.
     App.emitTo("summary", "ghostpen://summary-status", .{
         .state = link_summary.state,
@@ -567,6 +589,14 @@ pub fn showWindow(label: []const u8, center: bool) void {
     w.focus();
 }
 
+/// The page's message for an image `image.fitWithin` refused or could not read.
+fn imageFail(err: anyerror) error{CommandFailed} {
+    return switch (err) {
+        error.ImageTooLarge => oriel.ipc.fail("The image is too large (over {d} megapixels).", .{image.max_pixels / 1_000_000}),
+        else => oriel.ipc.fail("Could not read the image ({s}).", .{@errorName(err)}),
+    };
+}
+
 // ---- commands ----------------------------------------------------------------------------
 
 pub const Commands = struct {
@@ -578,8 +608,7 @@ pub const Commands = struct {
         "menu_dismissed",          "update_check",         "update_install",        "whisper_models_status",
         "whisper_download_model",  "whisper_delete_model", "summarize_link",        "summary_state",
         "tts_speak",               "tts_state",            "tts_catalog",           "tts_download",
-        "tts_delete",              "tts_warm_up",
-        "paste_result",
+        "tts_delete",              "tts_warm_up",          "paste_result",
     };
 
     pub fn get_settings(arena: std.mem.Allocator) !Settings {
@@ -638,7 +667,7 @@ pub const Commands = struct {
             .text => |t| .{ .kind = "text", .text = try arena.dupe(u8, t) },
             .image => |png| blk: {
                 const size = image.pngSize(png) orelse image.Size{ .width = 0, .height = 0 };
-                const thumb = image.fitWithin(gpa, png, 512) catch |err| return oriel.ipc.fail("Could not read the image ({s}).", .{@errorName(err)});
+                const thumb = image.fitWithin(gpa, png, 512) catch |err| return imageFail(err);
                 defer gpa.free(thumb);
                 const uri = try image.dataUri(gpa, thumb);
                 defer gpa.free(uri);
@@ -664,7 +693,7 @@ pub const Commands = struct {
         state_mutex.unlock(io);
         const src = png orelse return oriel.ipc.fail("No image selected.", .{});
 
-        const scaled = image.fitWithin(gpa, src, s.ocr.maxDimension) catch |err| return oriel.ipc.fail("Could not read the image ({s}).", .{@errorName(err)});
+        const scaled = image.fitWithin(gpa, src, s.ocr.maxDimension) catch |err| return imageFail(err);
         defer gpa.free(scaled);
         var profile = s.activeProfile();
         if (s.ocr.modelOverride.len > 0) profile.model = s.ocr.modelOverride;
@@ -704,8 +733,8 @@ pub const Commands = struct {
     }
 
     /// The voice's state now (a window gets it on load; updates come by event).
-    pub fn tts_state(_: std.mem.Allocator) !tts.State {
-        return tts.status();
+    pub fn tts_state(arena: std.mem.Allocator) !tts.State {
+        return tts.statusAlloc(arena);
     }
 
     /// Load the voice ahead of a reading (the reader opened); nothing when
@@ -771,7 +800,8 @@ pub const Commands = struct {
     }
 
     /// Playground: transform text directly, no clipboard.
-    pub fn process_text(arena: std.mem.Allocator, args: struct { action: []const u8, targetLang: ?[]const u8 = null, level: ?[]const u8 = null, text: []const u8 }) ![]const u8 {        const s = try shared.get(io, arena);
+    pub fn process_text(arena: std.mem.Allocator, args: struct { action: []const u8, targetLang: ?[]const u8 = null, level: ?[]const u8 = null, text: []const u8 }) ![]const u8 {
+        const s = try shared.get(io, arena);
         const r = try resolveAction(arena, s, args.action, args.targetLang, parseLevel(args.level));
         return complete(arena, .{ .profile = r.profile, .system = r.system, .user = .{ .text = args.text } });
     }
@@ -803,7 +833,11 @@ pub const Commands = struct {
     pub fn summary_state(arena: std.mem.Allocator) !SummaryState {
         summary_mutex.lockUncancelable(io);
         defer summary_mutex.unlock(io);
+        // Copies: the globals change once the lock is released, before the
+        // reply is serialized.
         var out = link_summary;
+        out.title = arena.dupe(u8, link_summary.title) catch "";
+        out.message = arena.dupe(u8, link_summary.message) catch "";
         out.markdown = arena.dupe(u8, summary_markdown.items) catch "";
         // The read-aloud's whole page (kept under the TTS request limit).
         const limit = 200_000;
@@ -824,8 +858,8 @@ pub const Commands = struct {
         {
             summary_mutex.lockUncancelable(io);
             defer summary_mutex.unlock(io);
-            link_summary = .{ .state = "fetching", .title = url };
             summary_markdown.clearRetainingCapacity();
+            summaryStoreLocked("fetching", url, 0, "");
             if (summary_page_text.len > 0) gpa.free(summary_page_text);
             summary_page_text = &.{};
         }
@@ -854,7 +888,7 @@ pub const Commands = struct {
         const Emit = struct {
             fn chunk(_: void, delta: []const u8) void {
                 summary_mutex.lockUncancelable(io);
-                summary_markdown.appendSlice(gpa, delta) catch {};
+                summary_markdown.appendSlice(gpa, delta) catch |err| log.warn("summary: a chunk was not kept ({s})", .{@errorName(err)});
                 link_summary.markdown = summary_markdown.items;
                 summary_mutex.unlock(io);
                 App.emitTo("summary", "ghostpen://summary-chunk", delta) catch {};

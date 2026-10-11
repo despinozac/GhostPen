@@ -287,8 +287,14 @@ fn requestOnce(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, req
     w.writeAll(std.mem.sliceAsBytes(samples)) catch return lost(io);
     w.flush() catch return lost(io);
 
+    // A hung runner must not hold `mutex` forever: the answer has a deadline
+    // (loading the model, then the audio on a slow CPU, generously).
+    const audio_s = samples.len / sample_rate;
+    const deadline_ms: u64 = reply_base_ms + reply_ms_per_audio_s * audio_s;
+    const sent = std.Io.Clock.Timestamp.now(io, .awake);
     while (true) {
-        const out = (r.reader.interface.takeDelimiter('\n') catch null) orelse return lost(io);
+        const waited: u64 = @intCast(@max(0, sent.durationTo(.now(io, .awake)).raw.toMilliseconds()));
+        const out = readLine(io, r, deadline_ms -| waited) orelse return lost(io);
         // alloc_always: the line is in the reader's buffer, reused by the next read.
         const reply = std.json.parseFromSliceLeaky(Reply, arena, out, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
         // Id 0: a request it couldn't read (it exits then).
@@ -302,6 +308,70 @@ fn requestOnce(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, req
         }
         return reply;
     }
+}
+
+/// How long a reply may take: a fixed part (the model's load) plus a
+/// multiple of the audio's length (a large model on the CPU is slower than
+/// real time).
+const reply_base_ms = 180_000;
+const reply_ms_per_audio_s = 4_000;
+/// How long a starting runner may take to load its GPU backend.
+const ready_timeout_ms = 120_000;
+
+/// The runner's next stdout line, or null when it ended, broke or stayed
+/// silent for `timeout_ms` (then it is killed; the caller stops it). Caller
+/// holds `mutex`; the line is in the reader's buffer.
+fn readLine(io: std.Io, r: *Runner, timeout_ms: u64) ?[]u8 {
+    const Read = struct {
+        fn line(rd: *std.Io.Reader) ?[]u8 {
+            return rd.takeDelimiter('\n') catch null;
+        }
+        fn sleep(i: std.Io, ms: u64) void {
+            i.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+        }
+    };
+    if (timeout_ms == 0) {
+        log.warn("the whisper runner didn't answer in time", .{});
+        kill(r);
+        return null;
+    }
+    const Outcome = union(enum) { line: ?[]u8, timeout: void };
+    var buf: [2]Outcome = undefined;
+    var sel = std.Io.Select(Outcome).init(io, &buf);
+    // No concurrency here: read without a deadline (as before).
+    sel.concurrent(.line, Read.line, .{&r.reader.interface}) catch return Read.line(&r.reader.interface);
+    // The read points into the runner: kill it first (the read sees EOF),
+    // then wait for the read to end; never return while it may still run.
+    sel.concurrent(.timeout, Read.sleep, .{ io, timeout_ms }) catch {
+        kill(r);
+        sel.cancelDiscard();
+        return null;
+    };
+    const first = sel.await() catch {
+        kill(r);
+        sel.cancelDiscard();
+        return null;
+    };
+    switch (first) {
+        .line => |l| {
+            sel.cancelDiscard();
+            return l;
+        },
+        .timeout => {
+            log.warn("the whisper runner didn't answer in {d} s: stopping it", .{timeout_ms / 1000});
+            kill(r);
+            sel.cancelDiscard();
+            return null;
+        },
+    }
+}
+
+/// Kill the runner's process (not reaped: `stop` does that).
+fn kill(r: *Runner) void {
+    if (r.child.id) |id| switch (builtin.os.tag) {
+        .windows => _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1)),
+        else => std.posix.kill(id, std.posix.SIG.KILL) catch |err| log.warn("could not kill the whisper runner: {s}", .{@errorName(err)}),
+    };
 }
 
 /// The runner died or the pipe broke: stop it (the next request starts
@@ -391,8 +461,10 @@ fn ensureRunner(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator) !*
     // The ready line, once the GPU backend is loaded; anything else a GPU
     // backend prints on stdout first is skipped.
     const Ready = struct { ready: bool = false, gpu: ?[]const u8 = null };
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
     const ready: Ready = while (true) {
-        const line = (r.reader.interface.takeDelimiter('\n') catch null) orelse {
+        const waited: u64 = @intCast(@max(0, started.durationTo(.now(io, .awake)).raw.toMilliseconds()));
+        const line = readLine(io, r, ready_timeout_ms -| waited) orelse {
             var why: [256]u8 = undefined;
             log.warn("the whisper runner exited at startup: {s}", .{lastError(io, &why)});
             stop(io);
@@ -419,10 +491,7 @@ fn stop(io: std.Io) void {
     runner = null;
     // Kill, let the stderr drain see EOF and end, then reap (which closes the
     // pipes): never close a pipe another thread still reads.
-    if (r.child.id) |id| switch (builtin.os.tag) {
-        .windows => _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1)),
-        else => std.posix.kill(id, std.posix.SIG.KILL) catch {},
-    };
+    kill(r);
     if (r.stderr_thread) |t| t.join();
     r.child.kill(io);
     runner_gpa.free(r.stdout_buf);
@@ -594,7 +663,7 @@ pub fn remove(io: std.Io, gpa: std.mem.Allocator, id: []const u8) !void {
     }
     const part = try std.fmt.allocPrint(gpa, "{s}.part", .{p});
     defer gpa.free(part);
-    std.Io.Dir.cwd().deleteFile(io, part) catch {};
+    std.Io.Dir.cwd().deleteFile(io, part) catch |err| if (err != error.FileNotFound) log.warn("could not delete {s}: {s}", .{ part, @errorName(err) });
     log.info("deleted whisper model {s}", .{id});
 }
 

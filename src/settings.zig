@@ -113,7 +113,40 @@ pub const Settings = struct {
         for (self.profiles) |p| if (std.mem.eql(u8, p.id, self.activeProfileId)) return p;
         return if (self.profiles.len > 0) self.profiles[0] else default_profile;
     }
+
+    /// Bring the numbers into their sane ranges (the page's controls stay
+    /// within them, but the file can be edited by hand and the page is not
+    /// trusted). A profile list that needs fixing is copied into `arena`.
+    pub fn clamp(self: *Settings, arena: std.mem.Allocator) !void {
+        const c = std.math.clamp;
+        self.ocr.maxDimension = c(self.ocr.maxDimension, 64, 8192);
+        self.localLlm.ctxTokens = c(self.localLlm.ctxTokens, min_ctx, max_ctx);
+        self.localLlm.moePct = @min(self.localLlm.moePct, 100);
+        self.localLlm.idleMinutes = @min(self.localLlm.idleMinutes, 24 * 60);
+        // 0 = the built-in model's setting.
+        if (self.server.ctxTokens != 0) self.server.ctxTokens = c(self.server.ctxTokens, min_ctx, max_ctx);
+        if (self.server.port == 0) self.server.port = (Server{}).port;
+        self.captions.chunkSeconds = finiteIn(self.captions.chunkSeconds, 1.0, 60.0, (Captions{}).chunkSeconds);
+        self.captions.fontSize = c(self.captions.fontSize, 8, 200);
+        self.restoreDelayMs = @min(self.restoreDelayMs, 10_000);
+        for (self.profiles, 0..) |p, i| {
+            if (finiteIn(p.temperature, 0.0, 2.0, 0.2) == p.temperature) continue;
+            const copy = try arena.dupe(Profile, self.profiles);
+            for (copy[i..]) |*q| q.temperature = finiteIn(q.temperature, 0.0, 2.0, 0.2);
+            self.profiles = copy;
+            break;
+        }
+    }
 };
+
+const min_ctx = 512;
+const max_ctx = 1024 * 1024;
+
+/// `v` within `[lo, hi]`; `fallback` when it isn't a number.
+fn finiteIn(v: f64, lo: f64, hi: f64, fallback: f64) f64 {
+    if (!std.math.isFinite(v)) return fallback;
+    return std.math.clamp(v, lo, hi);
+}
 
 pub const default_profile: Profile = .{
     .id = "ollama-local",
@@ -128,7 +161,9 @@ pub const app_id = "dev.ghostpen.Oriel";
 /// `{"settings": {...}}`); missing fields take their defaults.
 pub fn parse(arena: std.mem.Allocator, value: std.json.Value) !Settings {
     const v = if (value == .object) (value.object.get("settings") orelse value) else value;
-    return std.json.parseFromValueLeaky(Settings, arena, v, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    var s = try std.json.parseFromValueLeaky(Settings, arena, v, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    try s.clamp(arena);
+    return s;
 }
 
 /// A deep copy through JSON (settings are small; this keeps it obviously right).
@@ -171,4 +206,39 @@ test "parse: defaults, envelope, unknown fields" {
     const l = try parse(a, local);
     try std.testing.expect(l.activeProfile().isLocal());
     try std.testing.expectEqual(@as(u32, 4096), l.localLlm.ctxTokens);
+}
+
+test "clamp: out-of-range numbers come back into range" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"ocr":{"maxDimension":0},"localLlm":{"ctxTokens":4000000000,"moePct":250,"idleMinutes":999999},
+        \\ "server":{"ctxTokens":1,"port":0},"captions":{"chunkSeconds":0.01,"fontSize":4000},"restoreDelayMs":99999999,
+        \\ "profiles":[{"id":"a","name":"A","model":"m","temperature":7.5},{"id":"b","name":"B","model":"m","temperature":0.7}]}
+    , .{});
+    const s = try parse(a, v);
+    try std.testing.expectEqual(@as(u32, 64), s.ocr.maxDimension);
+    try std.testing.expectEqual(@as(u32, max_ctx), s.localLlm.ctxTokens);
+    try std.testing.expectEqual(@as(u8, 100), s.localLlm.moePct);
+    try std.testing.expectEqual(@as(u32, 24 * 60), s.localLlm.idleMinutes);
+    try std.testing.expectEqual(@as(u32, min_ctx), s.server.ctxTokens);
+    try std.testing.expectEqual(@as(u16, 8771), s.server.port);
+    try std.testing.expectEqual(@as(f64, 1.0), s.captions.chunkSeconds);
+    try std.testing.expectEqual(@as(u32, 200), s.captions.fontSize);
+    try std.testing.expectEqual(@as(u64, 10_000), s.restoreDelayMs);
+    try std.testing.expectEqual(@as(f64, 2.0), s.profiles[0].temperature);
+    try std.testing.expectEqual(@as(f64, 0.7), s.profiles[1].temperature);
+
+    // In range: left alone (and the default profile list isn't copied).
+    var d: Settings = .{};
+    try d.clamp(a);
+    try std.testing.expectEqual(@as(u32, 1024), d.ocr.maxDimension);
+    try std.testing.expectEqual(@as(u32, 0), d.server.ctxTokens);
+    try std.testing.expect(d.profiles.ptr == (Settings{}).profiles.ptr);
+
+    var nan: Settings = .{};
+    nan.captions.chunkSeconds = std.math.nan(f64);
+    try nan.clamp(a);
+    try std.testing.expectEqual(@as(f64, 5.0), nan.captions.chunkSeconds);
 }

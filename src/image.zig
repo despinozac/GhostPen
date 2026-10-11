@@ -16,10 +16,24 @@ pub fn pngSize(png: []const u8) ?Size {
     };
 }
 
+/// The most pixels an image may claim before it is decoded (a 50 MP RGBA
+/// decode is already 200 MB; a forged header could ask for far more).
+pub const max_pixels: u64 = 50_000_000;
+
+/// The header's size, checked: `error.InvalidImage` for a zero side,
+/// `error.ImageTooLarge` past `max_pixels`.
+pub fn checkedSize(png: []const u8) !Size {
+    const size = pngSize(png) orelse return error.NotPng;
+    if (size.width == 0 or size.height == 0) return error.InvalidImage;
+    const pixels = std.math.mul(u64, size.width, size.height) catch return error.ImageTooLarge;
+    if (pixels > max_pixels) return error.ImageTooLarge;
+    return size;
+}
+
 /// `png` scaled down so neither side exceeds `max` (aspect kept), as PNG.
 /// Returns a copy of the input when it already fits. Caller owns the result.
 pub fn fitWithin(gpa: std.mem.Allocator, png: []const u8, max: u32) ![]u8 {
-    const size = pngSize(png) orelse return error.NotPng;
+    const size = try checkedSize(png);
     if (size.width <= max and size.height <= max) return gpa.dupe(u8, png);
 
     var img = try zigimg.Image.fromMemory(gpa, png);
@@ -97,4 +111,19 @@ test "fitWithin downsizes, keeps aspect, and passes small images through" {
     const uri = try dataUri(gpa, "PNG");
     defer gpa.free(uri);
     try std.testing.expectEqualStrings("data:image/png;base64,UE5H", uri);
+}
+
+test "fitWithin rejects zero-sized and oversized headers before decoding" {
+    const gpa = std.testing.allocator;
+    var png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x00\x00\x00\x00\x00".*;
+    std.mem.writeInt(u32, png[16..20], 0, .big);
+    std.mem.writeInt(u32, png[20..24], 100, .big);
+    try std.testing.expectError(error.InvalidImage, fitWithin(gpa, &png, 512));
+    std.mem.writeInt(u32, png[16..20], 10_000, .big);
+    std.mem.writeInt(u32, png[20..24], 10_000, .big);
+    try std.testing.expectError(error.ImageTooLarge, fitWithin(gpa, &png, 512));
+    std.mem.writeInt(u32, png[16..20], std.math.maxInt(u32), .big);
+    std.mem.writeInt(u32, png[20..24], std.math.maxInt(u32), .big);
+    try std.testing.expectError(error.ImageTooLarge, fitWithin(gpa, &png, 512));
+    try std.testing.expectError(error.NotPng, fitWithin(gpa, "nope", 512));
 }

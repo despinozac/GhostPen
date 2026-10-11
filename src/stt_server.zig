@@ -32,6 +32,7 @@ const std = @import("std");
 const main = @import("main.zig");
 const models = @import("models.zig");
 const model_server = @import("model_server.zig");
+const whisper_helper = @import("whisper_helper.zig");
 
 const log = std.log.scoped(.stt_server);
 const gpa = std.heap.smp_allocator;
@@ -49,6 +50,10 @@ var config: Config = .{ .model_override = null, .language = "auto" };
 var env_map: *const std.process.Environ.Map = undefined;
 /// Whisper loaded at startup (GHOSTPEN_STT_SERVER=1), else on the first request.
 var preload = false;
+/// The listening port, and whether the bind address is loopback (then only
+/// loopback Host names are served: `hostAllowed`).
+var bind_port: u16 = 8771;
+var bind_loopback = true;
 
 /// Start the server (see the top of the file). Never fails: problems are logged.
 pub fn maybeStart(io: std.Io, env: *const std.process.Environ.Map) void {
@@ -75,6 +80,8 @@ pub fn maybeStart(io: std.Io, env: *const std.process.Environ.Map) void {
         log.warn("invalid GHOSTPEN_STT_BIND \"{s}\": not starting", .{bind});
         return;
     };
+    bind_port = address.getPort();
+    bind_loopback = isLoopback(address);
     const t = std.Thread.spawn(.{}, serve, .{ io, address, bind }) catch |err| {
         log.warn("can't start: {s}", .{@errorName(err)});
         return;
@@ -89,6 +96,13 @@ fn parseBind(bind: []const u8) !std.Io.net.IpAddress {
     var host = bind[0..colon];
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
     return std.Io.net.IpAddress.parse(host, port);
+}
+
+fn isLoopback(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &(.{0} ** 15 ++ .{1})),
+    };
 }
 
 /// The model the server was started with (GHOSTPEN_STT_MODEL), if any.
@@ -129,29 +143,118 @@ fn serve(io: std.Io, address: std.Io.net.IpAddress, bind: []const u8) void {
         model_server.writeDiscovery(io, env_map, url, currentModel(arena.allocator()));
         log.info("model service on http://{s}", .{bind});
     }
+    if (std.Thread.spawn(.{}, watchConnections, .{io})) |t| t.detach() else |err| log.warn("no read timeouts ({s})", .{@errorName(err)});
     while (true) {
         const stream = server.accept(io) catch |err| {
             log.warn("accept: {s}", .{@errorName(err)});
             io.sleep(.fromMilliseconds(100), .awake) catch {};
             continue;
         };
-        const t = std.Thread.spawn(.{}, handleConnection, .{ io, stream }) catch {
-            stream.close(io);
+        const conn = claimConnection(io, stream) orelse {
+            refuseConnection(io, stream);
+            continue;
+        };
+        const t = std.Thread.spawn(.{}, handleConnection, .{ io, conn }) catch {
+            releaseConnection(io, conn);
             continue;
         };
         t.detach();
     }
 }
 
-fn handleConnection(io: std.Io, stream: std.Io.net.Stream) void {
+/// Connections served at once (a thread each, and a transcription's upload
+/// can hold hundreds of MB): more get a 503.
+const max_connections = 16;
+/// A client this slow to send a request's head (or the next one on a
+/// kept-alive connection), or its body, is cut off: a stalled peer would
+/// hold its slot forever. Not while the model works on the answer.
+const head_timeout_ms = 30_000;
+const body_timeout_ms = 5 * 60_000;
+
+const Connection = struct {
+    stream: std.Io.net.Stream = undefined,
+    used: bool = false,
+    /// While reading from the client: when to give up (awake clock, ms); 0
+    /// otherwise.
+    deadline_ms: std.atomic.Value(i64) = .init(0),
+};
+
+/// Guards `used` and `stream`: the watchdog never shuts down a closed (or
+/// reused) socket.
+var conns_mutex: std.Io.Mutex = .init;
+var conns: [max_connections]Connection = @splat(.{});
+threadlocal var this_conn: ?*Connection = null;
+
+fn claimConnection(io: std.Io, stream: std.Io.net.Stream) ?*Connection {
+    conns_mutex.lockUncancelable(io);
+    defer conns_mutex.unlock(io);
+    for (&conns) |*c| if (!c.used) {
+        c.* = .{ .stream = stream, .used = true };
+        return c;
+    };
+    return null;
+}
+
+fn releaseConnection(io: std.Io, conn: *Connection) void {
+    {
+        conns_mutex.lockUncancelable(io);
+        defer conns_mutex.unlock(io);
+        conn.used = false;
+        conn.deadline_ms.store(0, .release);
+    }
+    conn.stream.close(io);
+}
+
+fn refuseConnection(io: std.Io, stream: std.Io.net.Stream) void {
     defer stream.close(io);
+    const body = "busy: too many connections, retry later";
+    const response = std.fmt.comptimePrint("HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ body.len, body });
+    var buf: [256]u8 = undefined;
+    var w = stream.writer(io, &buf);
+    w.interface.writeAll(response) catch return;
+    w.interface.flush() catch {};
+}
+
+/// This thread's connection reads from the client for at most `ms` from now
+/// (0: not reading, no deadline).
+fn readingFor(io: std.Io, ms: i64) void {
+    const conn = this_conn orelse return;
+    conn.deadline_ms.store(if (ms == 0) 0 else std.Io.Clock.awake.now(io).toMilliseconds() + ms, .release);
+}
+
+/// Shuts down the sockets past their read deadline: the blocked read ends
+/// (EOF) and the thread closes the connection. A socket receive timeout
+/// (SO_RCVTIMEO) would make Zig's reader see EAGAIN, a panic in debug
+/// builds, and Windows has no posix setsockopt.
+fn watchConnections(io: std.Io) void {
+    while (true) {
+        io.sleep(.fromSeconds(1), .awake) catch return;
+        const now = std.Io.Clock.awake.now(io).toMilliseconds();
+        conns_mutex.lockUncancelable(io);
+        defer conns_mutex.unlock(io);
+        for (&conns) |*c| {
+            if (!c.used) continue;
+            const deadline = c.deadline_ms.load(.acquire);
+            if (deadline == 0 or now < deadline) continue;
+            c.deadline_ms.store(0, .release);
+            c.stream.shutdown(io, .both) catch {};
+        }
+    }
+}
+
+fn handleConnection(io: std.Io, conn: *Connection) void {
+    defer releaseConnection(io, conn);
+    this_conn = conn;
+    defer this_conn = null;
     var in_buf: [16 * 1024]u8 = undefined;
     var out_buf: [16 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
-    var writer = stream.writer(io, &out_buf);
+    var reader = conn.stream.reader(io, &in_buf);
+    var writer = conn.stream.writer(io, &out_buf);
     var http: std.http.Server = .init(&reader.interface, &writer.interface);
     while (true) {
+        readingFor(io, head_timeout_ms);
         var request = http.receiveHead() catch return;
+        readingFor(io, 0);
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         handle(io, arena.allocator(), &request) catch return;
@@ -162,8 +265,24 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream) void {
 /// Transcriptions running or waiting for the model.
 var active: std.atomic.Value(u32) = .init(0);
 const max_active = 2;
+/// Chat and embedding requests running or queued for their runner (one
+/// runs at a time; each waiting one holds its body and a connection).
+var chat_queued: std.atomic.Value(u32) = .init(0);
+var embed_queued: std.atomic.Value(u32) = .init(0);
+const max_queued = 4;
 
 const Reply = model_server.Reply;
+
+fn textReply(status: std.http.Status, message: []const u8) Reply {
+    return .{ .status = status, .body = message, .content_type = "text/plain; charset=utf-8" };
+}
+
+/// One more request on `counter`, unless `max` are already there.
+fn admit(counter: *std.atomic.Value(u32), max: u32) bool {
+    if (counter.fetchAdd(1, .acq_rel) < max) return true;
+    _ = counter.fetchSub(1, .acq_rel);
+    return false;
+}
 
 fn handle(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Request) !void {
     // A POST with neither Content-Length nor chunked encoding has no body,
@@ -172,8 +291,11 @@ fn handle(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Reques
     if (request.head.method.requestHasBody() and request.head.content_length == null and request.head.transfer_encoding == .none)
         request.head.keep_alive = false;
     const path = if (std.mem.indexOfScalar(u8, request.head.target, '?')) |q| request.head.target[0..q] else request.head.target;
-    const reply: Reply = if (std.mem.eql(u8, path, "/health") and request.head.method == .GET)
-        .{ .body = "ok", .content_type = "text/plain; charset=utf-8" }
+    const reply: Reply = if (refusal(request)) |r| blk: {
+        request.head.keep_alive = false; // its body is unread
+        break :blk r;
+    } else if (std.mem.eql(u8, path, "/health") and request.head.method == .GET)
+        textReply(.ok, "ok")
     else if (std.mem.eql(u8, path, "/v1/models") and request.head.method == .GET)
         .{ .body = try modelsBody(arena) }
     else if (std.mem.eql(u8, path, "/props") and request.head.method == .GET)
@@ -182,36 +304,116 @@ fn handle(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Reques
         try model_server.slotsReply(arena)
     else if (std.mem.eql(u8, path, "/metrics") and request.head.method == .GET)
         try model_server.metricsReply(io, arena)
-    else if (std.mem.eql(u8, path, "/unload") and request.head.method == .POST)
-        try model_server.unloadReply(io, arena, try readJsonBody(arena, request) orelse "")
-    else if (std.mem.eql(u8, path, "/v1/embeddings") and request.head.method == .POST)
-        try model_server.embeddingsReply(io, arena, try readJsonBody(arena, request) orelse return error.BadBody)
-    else if (std.mem.eql(u8, path, "/v1/chat/completions") and request.head.method == .POST) blk: {
-        const body = try readJsonBody(arena, request) orelse return error.BadBody;
-        break :blk (try model_server.chatReply(io, arena, request, body)) orelse return; // streamed
+    else if (std.mem.eql(u8, path, "/unload") and request.head.method == .POST) switch (try readJsonBody(io, arena, request)) {
+        .data => |body| try model_server.unloadReply(io, arena, body),
+        .refused => |r| r,
+    } else if (std.mem.eql(u8, path, "/v1/embeddings") and request.head.method == .POST) blk: {
+        if (!admit(&embed_queued, max_queued)) break :blk busy(arena, request, "busy: too many embedding requests waiting, retry later");
+        defer _ = embed_queued.fetchSub(1, .acq_rel);
+        break :blk switch (try readJsonBody(io, arena, request)) {
+            .data => |body| try model_server.embeddingsReply(io, arena, body),
+            .refused => |r| r,
+        };
+    } else if (std.mem.eql(u8, path, "/v1/chat/completions") and request.head.method == .POST) blk: {
+        if (!admit(&chat_queued, max_queued)) break :blk busy(arena, request, "busy: too many chat requests waiting, retry later");
+        defer _ = chat_queued.fetchSub(1, .acq_rel);
+        break :blk switch (try readJsonBody(io, arena, request)) {
+            .data => |body| (try model_server.chatReply(io, arena, request, body)) orelse return, // streamed
+            .refused => |r| r,
+        };
     } else if (std.mem.eql(u8, path, "/v1/audio/transcriptions") and request.head.method == .POST) blk: {
         // Each request can hold hundreds of MB (the upload and its PCM) while
         // it waits for the one whisper model: a few at a time.
-        if (active.fetchAdd(1, .acq_rel) >= max_active) {
-            _ = active.fetchSub(1, .acq_rel);
-            try request.respond("busy: too many transcriptions at once, retry later", .{
-                .status = .service_unavailable,
-                .keep_alive = false,
-                .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
-            });
-            return error.Busy; // the unread body: close the connection
+        if (!admit(&active, max_active)) {
+            request.head.keep_alive = false; // the unread body: close the connection
+            break :blk textReply(.service_unavailable, "busy: too many transcriptions at once, retry later");
         }
         defer _ = active.fetchSub(1, .acq_rel);
         break :blk transcriptionReply(io, arena, request) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => .{ .status = .internal_server_error, .body = @errorName(err), .content_type = "text/plain; charset=utf-8" },
+            else => textReply(.internal_server_error, @errorName(err)),
         };
-    } else .{ .status = .not_found, .body = "not found", .content_type = "text/plain; charset=utf-8" };
+    } else textReply(.not_found, "not found");
     try request.respond(reply.body, .{
         .status = reply.status,
         .keep_alive = request.head.keep_alive,
         .extra_headers = &.{.{ .name = "content-type", .value = reply.content_type }},
     });
+}
+
+/// A 503 before the body is read (the connection closes).
+fn busy(arena: std.mem.Allocator, request: *std.http.Server.Request, message: []const u8) Reply {
+    request.head.keep_alive = false;
+    return model_server.errorReply(.service_unavailable, message, arena);
+}
+
+/// A reply refusing what a web page could send: this service has no
+/// authentication, so it must not answer a browser.
+fn refusal(request: *const std.http.Server.Request) ?Reply {
+    var host: ?[]const u8 = null;
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        // Browsers send Origin on cross-site POSTs (and fetches); native
+        // clients (GhostReel, curl, the OpenAI SDKs) don't, and GhostPen's own
+        // UI never calls this server.
+        if (std.ascii.eqlIgnoreCase(h.name, "origin")) return textReply(.forbidden, "forbidden: browser requests aren't served");
+        if (std.ascii.eqlIgnoreCase(h.name, "host")) host = h.value;
+    }
+    if (!hostAllowed(host, bind_port, bind_loopback)) return textReply(.forbidden, "forbidden: unexpected Host");
+    return null;
+}
+
+/// Whether a request's Host names this server. Bound to loopback, only
+/// loopback names: a page whose DNS name was rebound to 127.0.0.1 sends its
+/// own. Bound to the network, any (the clients use whatever address
+/// reaches it; `refusal` still turns browsers away). No Host (HTTP/1.0):
+/// not a browser.
+fn hostAllowed(host: ?[]const u8, port: u16, loopback: bool) bool {
+    if (!loopback) return true;
+    const h = std.mem.trim(u8, host orelse return true, " \t");
+    // `name:port`, or the name alone when the port is HTTP's default.
+    var name = h;
+    var host_port: u16 = 80;
+    if (std.mem.lastIndexOfScalar(u8, h, ':')) |i| {
+        // Not inside a bare IPv6 address (`[::1]` has colons of its own).
+        if (std.mem.endsWith(u8, h[0..i], "]") or std.mem.indexOfScalar(u8, h[0..i], ':') == null) {
+            name = h[0..i];
+            host_port = std.fmt.parseInt(u16, h[i + 1 ..], 10) catch return false;
+        }
+    }
+    if (host_port != port) return false;
+    return std.ascii.eqlIgnoreCase(name, "localhost") or std.mem.eql(u8, name, "127.0.0.1") or std.mem.eql(u8, name, "[::1]");
+}
+
+const Body = union(enum) { data: []const u8, refused: Reply };
+
+/// A JSON request body (chat requests carry base64 images: up to 40 MB),
+/// or the reply refusing it (the connection then closes: its body may be
+/// unread).
+fn readJsonBody(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Request) !Body {
+    const limit = 40 * 1024 * 1024;
+    // No length and not chunked: HTTP says there's no body (don't wait for one).
+    if (request.head.content_length == null and request.head.transfer_encoding == .none) return .{ .data = "" };
+    if (request.head.content_length == 0) return .{ .data = "" };
+    // A browser can POST text/plain anywhere without asking first; JSON
+    // needs its preflight, which this server never grants.
+    const json = if (request.head.content_type) |ct| std.ascii.startsWithIgnoreCase(std.mem.trim(u8, ct, " "), "application/json") else false;
+    // Until it's all read, a refusal closes the connection.
+    const keep_alive = request.head.keep_alive;
+    request.head.keep_alive = false;
+    if (!json) return .{ .refused = model_server.errorReply(.unsupported_media_type, "expected Content-Type: application/json", arena) };
+    if (request.head.content_length) |len| if (len > limit) return .{ .refused = model_server.errorReply(.payload_too_large, "the body is too large (40 MB at most)", arena) };
+    readingFor(io, body_timeout_ms);
+    defer readingFor(io, 0);
+    var body_buf: [64 * 1024]u8 = undefined;
+    const r = request.readerExpectContinue(&body_buf) catch return .{ .refused = model_server.errorReply(.bad_request, "can't read the body", arena) };
+    const body = r.allocRemaining(arena, .limited(limit)) catch |err| return switch (err) {
+        error.OutOfMemory => err,
+        error.StreamTooLong => .{ .refused = model_server.errorReply(.payload_too_large, "the body is too large (40 MB at most)", arena) },
+        else => .{ .refused = model_server.errorReply(.bad_request, "can't read the body", arena) },
+    };
+    request.head.keep_alive = keep_alive;
+    return .{ .data = body };
 }
 
 /// The whisper model first (clients read its `segments` capability from the
@@ -239,37 +441,32 @@ fn modelsBody(arena: std.mem.Allocator) ![]const u8 {
     return w.written();
 }
 
-/// A JSON request body (chat requests carry base64 images: up to 40 MB).
-fn readJsonBody(arena: std.mem.Allocator, request: *std.http.Server.Request) !?[]const u8 {
-    const limit = 40 * 1024 * 1024;
-    if (request.head.content_length) |len| if (len > limit) return null;
-    // No length and not chunked: HTTP says there's no body (don't wait for one).
-    if (request.head.content_length == null and request.head.transfer_encoding == .none) return "";
-    var body_buf: [64 * 1024]u8 = undefined;
-    const r = request.readerExpectContinue(&body_buf) catch return null;
-    return r.allocRemaining(arena, .limited(limit)) catch |err| switch (err) {
-        error.OutOfMemory => err,
-        else => null,
-    };
-}
-
 fn badRequest(message: []const u8) Reply {
     return .{ .status = .bad_request, .body = message, .content_type = "text/plain; charset=utf-8" };
 }
 
 fn transcriptionReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Request) !Reply {
-    const content_type = request.head.content_type orelse return badRequest("expected multipart/form-data");
+    // Until the body is all read, a refusal closes the connection.
+    const keep_alive = request.head.keep_alive;
+    request.head.keep_alive = false;
+    const content_type = request.head.content_type orelse return textReply(.unsupported_media_type, "expected multipart/form-data");
     // The head points into the connection's read buffer, which reading the
     // body reuses: copy what's needed first.
-    const boundary = try arena.dupe(u8, multipartBoundary(content_type) orelse return badRequest("expected multipart/form-data"));
-    if (request.head.content_length) |len| if (len > max_body) return badRequest("the upload is too large");
-    var body_buf: [64 * 1024]u8 = undefined;
-    const body_reader = request.readerExpectContinue(&body_buf) catch return badRequest("can't read the body");
-    const body = body_reader.allocRemaining(arena, .limited(max_body)) catch |err| return switch (err) {
-        error.OutOfMemory => err,
-        error.StreamTooLong => badRequest("the upload is too large"),
-        else => badRequest("can't read the body"),
+    const boundary = try arena.dupe(u8, multipartBoundary(content_type) orelse return textReply(.unsupported_media_type, "expected multipart/form-data"));
+    if (request.head.content_length) |len| if (len > max_body) return textReply(.payload_too_large, "the upload is too large");
+    const body = blk: {
+        // The deadline covers the upload, not the transcription.
+        readingFor(io, body_timeout_ms);
+        defer readingFor(io, 0);
+        var body_buf: [64 * 1024]u8 = undefined;
+        const body_reader = request.readerExpectContinue(&body_buf) catch return badRequest("can't read the body");
+        break :blk body_reader.allocRemaining(arena, .limited(max_body)) catch |err| return switch (err) {
+            error.OutOfMemory => err,
+            error.StreamTooLong => textReply(.payload_too_large, "the upload is too large"),
+            else => badRequest("can't read the body"),
+        };
     };
+    request.head.keep_alive = keep_alive;
 
     var audio: ?[]const u8 = null;
     var language: []const u8 = config.language;
@@ -287,10 +484,14 @@ fn transcriptionReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.S
         }
     }
     const data = audio orelse return badRequest("missing 'file' field");
-    const samples = decodeToPcm16k(io, arena, data) catch |err| return .{
-        .status = .bad_request,
-        .body = try std.fmt.allocPrint(arena, "audio decode failed: {s} (is ffmpeg installed?)", .{@errorName(err)}),
-        .content_type = "text/plain; charset=utf-8",
+    const samples = decodeToPcm16k(io, arena, data) catch |err| return switch (err) {
+        error.OutOfMemory => err,
+        error.StreamTooLong => textReply(.payload_too_large, "the audio is too long (3 hours at most)"),
+        else => .{
+            .status = .bad_request,
+            .body = try std.fmt.allocPrint(arena, "audio decode failed: {s} (is ffmpeg installed?)", .{@errorName(err)}),
+            .content_type = "text/plain; charset=utf-8",
+        },
     };
     const model = currentModel(arena);
     const transcript = try models.transcribeSegments(io, gpa, arena, model, samples, language);
@@ -364,7 +565,9 @@ const Multipart = struct {
 /// Any audio ffmpeg reads → 16 kHz mono f32 (what whisper takes).
 fn decodeToPcm16k(io: std.Io, arena: std.mem.Allocator, bytes: []const u8) ![]const f32 {
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1" },
+        // Only the pipe: an uploaded playlist or concat file can't make
+        // ffmpeg open local files or URLs.
+        .argv = &.{ "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "pipe", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1" },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -388,9 +591,10 @@ fn decodeToPcm16k(io: std.Io, arena: std.mem.Allocator, bytes: []const u8) ![]co
     var buf: [64 * 1024]u8 = undefined;
     var r = child.stdout.?.readerStreaming(io, &buf);
     // f32 samples straight into a 4-aligned buffer (no second copy). At most
-    // 2 GiB (~9 h of audio).
+    // what the whisper runner takes (3 h): longer fails here, not after
+    // decoding hours more.
     var pcm: std.array_list.Aligned(u8, .@"4") = .empty;
-    r.interface.appendRemainingAligned(arena, .@"4", &pcm, .limited(1 << 31)) catch |err| {
+    r.interface.appendRemainingAligned(arena, .@"4", &pcm, .limited(whisper_helper.max_samples * @sizeOf(f32))) catch |err| {
         // Kill first: ffmpeg blocked on a full stdout would keep the feeder
         // blocked on its stdin, and the join would never return.
         child.kill(io);
@@ -483,4 +687,23 @@ test parseBind {
     _ = try parseBind("0.0.0.0:8771");
     _ = try parseBind("[::1]:9000");
     try std.testing.expectError(error.InvalidBind, parseBind("nocolon"));
+}
+
+test hostAllowed {
+    try std.testing.expect(hostAllowed("127.0.0.1:8771", 8771, true));
+    try std.testing.expect(hostAllowed("LocalHost:8771", 8771, true));
+    try std.testing.expect(hostAllowed("[::1]:8771", 8771, true));
+    try std.testing.expect(hostAllowed(null, 8771, true));
+    try std.testing.expect(hostAllowed("localhost", 80, true));
+    // DNS rebinding: a page's own name, or the right name on another port.
+    try std.testing.expect(!hostAllowed("evil.example:8771", 8771, true));
+    try std.testing.expect(!hostAllowed("localhost:9999", 8771, true));
+    try std.testing.expect(!hostAllowed("localhost", 8771, true));
+    try std.testing.expect(!hostAllowed("[::1]", 8771, true));
+    try std.testing.expect(!hostAllowed("127.0.0.1:x", 8771, true));
+    // Bound to the network: whatever address the client used.
+    try std.testing.expect(hostAllowed("192.168.1.20:8771", 8771, false));
+    try std.testing.expect(isLoopback(try parseBind("127.0.0.1:8771")));
+    try std.testing.expect(isLoopback(try parseBind("[::1]:8771")));
+    try std.testing.expect(!isLoopback(try parseBind("0.0.0.0:8771")));
 }

@@ -358,6 +358,10 @@ pub fn embed(
         w.writeByte('\n') catch return lost(io, s, arena, diag);
         w.flush() catch return lost(io, s, arena, diag);
     }
+    // A runner that hangs is killed (a cancel only reaches the chat runner).
+    var deadline: Deadline = .{ .child = &r.child, .kill_after_ms = generate_timeout_ms };
+    deadline.start(io);
+    defer deadline.finish();
     const Line = struct {
         id: u64 = 0,
         done: bool = false,
@@ -366,7 +370,15 @@ pub fn embed(
         model: []const u8 = "",
     };
     while (true) {
-        const line = (r.reader.interface.takeDelimiter('\n') catch null) orelse return lost(io, s, arena, diag);
+        const line = (r.reader.interface.takeDelimiter('\n') catch null) orelse {
+            deadline.finish();
+            if (deadline.timed_out.load(.acquire)) {
+                stop(io, s);
+                diag.* = "The embedding model took too long and was stopped.";
+                return error.LocalFailed;
+            }
+            return lost(io, s, arena, diag);
+        };
         const msg = std.json.parseFromSliceLeaky(Line, arena, line, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
         if (msg.id != id and !(msg.id == 0 and msg.@"error" != null)) continue;
         r.last_used = .now(io, .awake);
@@ -376,6 +388,7 @@ pub fn embed(
         }
         if (msg.done) {
             model_out.* = msg.model;
+            deadline.finish(); // before a keep_alive of 0 kills the runner
             keepAlive(io, s, r, keep_alive_ms);
             return msg.embeddings;
         }
@@ -704,7 +717,7 @@ fn idleWatch(io: std.Io) void {
             s.mutex.lockUncancelable(io);
             defer s.mutex.unlock(io);
             const r = s.runner orelse continue;
-            const limit_ms: i64 = if (r.idle_override_ms) |ms| @intCast(ms) else if (r.idle_minutes == 0) continue else @as(i64, r.idle_minutes) * 60_000;
+            const limit_ms: i64 = if (r.idle_override_ms) |ms| std.math.cast(i64, ms) orelse std.math.maxInt(i64) else if (r.idle_minutes == 0) continue else @as(i64, r.idle_minutes) * 60_000;
             const idle = r.last_used.durationTo(.now(io, .awake));
             if (idle.raw.toMilliseconds() >= limit_ms) stop(io, s);
         }

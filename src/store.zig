@@ -49,12 +49,13 @@ pub const Shared = struct {
         return clone(arena, self.value);
     }
 
-    /// Replace and persist.
+    /// Replace and persist (numbers clamped into their ranges first).
     pub fn set(self: *Shared, io: std.Io, gpa: std.mem.Allocator, new: Settings) !void {
-        try writeStore(gpa, new);
         var fresh: std.heap.ArenaAllocator = .init(gpa);
         errdefer fresh.deinit();
-        const copy = try clone(fresh.allocator(), new);
+        var copy = try clone(fresh.allocator(), new);
+        try copy.clamp(fresh.allocator());
+        try writeStore(gpa, copy);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.arena.deinit();
@@ -135,4 +136,3 @@ fn writeStore(gpa: std.mem.Allocator, s: Settings) !void {
     defer store.deinit();
     try store.set("settings", s);
 }
-

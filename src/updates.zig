@@ -80,7 +80,10 @@ pub fn init(env: *const std.process.Environ.Map) void {
     // $APPIMAGE / $APPDIR (for replacing an AppImage), and removes a
     // replaced Windows exe left from the last update.
     updater.init(main.io, gpa, env) catch |err| log.warn("updater: {s}", .{@errorName(err)});
-    const t = std.Thread.spawn(.{}, autoLoop, .{}) catch return;
+    const t = std.Thread.spawn(.{}, autoLoop, .{}) catch |err| {
+        log.warn("automatic updates are off: no thread ({s})", .{@errorName(err)});
+        return;
+    };
     t.detach();
 }
 
@@ -246,7 +249,10 @@ fn autoLoop() void {
 fn autoCheck() void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const s = main.shared.get(main.io, arena_state.allocator()) catch return;
+    const s = main.shared.get(main.io, arena_state.allocator()) catch |err| {
+        log.warn("update check skipped: no settings ({s})", .{@errorName(err)});
+        return;
+    };
     if (!s.autoUpdate) return;
     const found = check(gpa) catch |err| {
         log.info("update check: {s}", .{errorText(err)});

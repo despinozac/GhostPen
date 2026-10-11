@@ -19,6 +19,11 @@ pub var local_resolver: ?*const fn (arena: std.mem.Allocator, profile: Profile, 
 /// Total time for one request (the Tauri app's reqwest timeout).
 pub const request_timeout_ms: u32 = 60_000;
 pub const max_tokens = 2048;
+/// The most an endpoint's answer may hold (a streamed one included), and
+/// one SSE line: far past any real answer, short of a runaway one.
+const max_response_bytes = 16 * 1024 * 1024;
+const max_sse_line_bytes = 1024 * 1024;
+const too_large = "The endpoint's answer is too large.";
 
 pub const Level = enum { subtle, balanced, strong };
 
@@ -226,11 +231,13 @@ fn truncate(s: []const u8, max: usize) []const u8 {
 /// One non-streamed completion; the reasoning blocks are stripped.
 fn postCompletion(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, req: Request, thinking: bool, diag: *Diag) Error![]const u8 {
     const body = try buildBody(arena, req, thinking, false);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const status = try exchange(io, gpa, arena, .POST, try endpoint(arena, req.profile.baseUrl, "/chat/completions"), req.profile.apiKey, body, &out.writer, diag);
-    if (status.class() != .success) return apiError(arena, diag, status, out.written());
+    var out: Capped = .{ .arena = arena };
+    out.init();
+    const status = exchange(io, gpa, arena, .POST, try endpoint(arena, req.profile.baseUrl, "/chat/completions"), req.profile.apiKey, body, &out.writer, diag) catch |err|
+        return out.failure(err, diag);
+    if (status.class() != .success) return apiError(arena, diag, status, out.list.items);
     const Resp = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } };
-    const parsed = std.json.parseFromSliceLeaky(Resp, arena, out.written(), .{ .ignore_unknown_fields = true }) catch
+    const parsed = std.json.parseFromSliceLeaky(Resp, arena, out.list.items, .{ .ignore_unknown_fields = true }) catch
         return failFmt(arena, diag, "Parse error: unexpected response from the endpoint", .{});
     const content = if (parsed.choices.len > 0) parsed.choices[0].message.content orelse "" else "";
     return stripReasoning(arena, content);
@@ -304,9 +311,15 @@ pub fn completeStream(
     const body = try buildBody(arena, req, false, true);
     var sink: SseSink(@TypeOf(ctx), on_chunk) = .{ .arena = arena, .ctx = ctx };
     sink.init();
-    const status = try exchange(io, gpa, arena, .POST, try endpoint(arena, req.profile.baseUrl, "/chat/completions"), req.profile.apiKey, body, &sink.writer, diag);
+    const status = exchange(io, gpa, arena, .POST, try endpoint(arena, req.profile.baseUrl, "/chat/completions"), req.profile.apiKey, body, &sink.writer, diag) catch |err| {
+        if (sink.too_large) return fail(diag, too_large);
+        if (sink.oom) return error.OutOfMemory;
+        return err;
+    };
+    // Its errors are the flags below (a last line past the cap, or memory).
     sink.finish() catch {};
     if (sink.oom) return error.OutOfMemory;
+    if (sink.too_large) return fail(diag, too_large);
     if (status.class() != .success) return apiError(arena, diag, status, sink.raw.items);
 
     const out = try stripReasoning(arena, sink.full.items);
@@ -325,6 +338,10 @@ fn SseSink(comptime Ctx: type, comptime on_chunk: fn (Ctx, []const u8) void) typ
         raw: std.ArrayList(u8) = .empty,
         done: bool = false,
         oom: bool = false,
+        /// A line or the whole body went past its cap.
+        too_large: bool = false,
+        /// Bytes of the body so far.
+        fed: usize = 0,
         /// One byte: a reader streaming into the writer needs some buffer
         /// (an empty one fails an assertion), and a larger one would hold
         /// the deltas back until it fills. With one byte, each byte reaches
@@ -362,10 +379,21 @@ fn SseSink(comptime Ctx: type, comptime on_chunk: fn (Ctx, []const u8) void) typ
         }
 
         fn feed(self: *Self, bytes: []const u8) !void {
-            errdefer self.oom = true;
+            self.fed += bytes.len;
+            if (self.fed > max_response_bytes) {
+                self.too_large = true;
+                return error.TooLarge;
+            }
+            errdefer |err| if (err == error.OutOfMemory) {
+                self.oom = true;
+            };
             if (self.raw.items.len < 1024) try self.raw.appendSlice(self.arena, bytes[0..@min(bytes.len, 1024 - self.raw.items.len)]);
             for (bytes) |b| {
                 if (b != '\n') {
+                    if (self.line.items.len >= max_sse_line_bytes) {
+                        self.too_large = true;
+                        return error.TooLarge;
+                    }
                     try self.line.append(self.arena, b);
                     continue;
                 }
@@ -402,13 +430,65 @@ fn SseSink(comptime Ctx: type, comptime on_chunk: fn (Ctx, []const u8) void) typ
     };
 }
 
+/// A writer collecting a response body into `arena`, failing past
+/// `max_response_bytes` (`over` tells that failure from the others).
+const Capped = struct {
+    arena: std.mem.Allocator,
+    list: std.ArrayList(u8) = .empty,
+    over: bool = false,
+    oom: bool = false,
+    buf: [4096]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+
+    fn init(self: *Capped) void {
+        self.writer = .{ .buffer = &self.buf, .vtable = &.{ .drain = drain } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Capped = @alignCast(@fieldParentPtr("writer", w));
+        try self.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.put(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.put(last);
+            n += last.len;
+        }
+        return n;
+    }
+
+    fn put(self: *Capped, bytes: []const u8) std.Io.Writer.Error!void {
+        if (self.list.items.len + bytes.len > max_response_bytes) {
+            self.over = true;
+            return error.WriteFailed;
+        }
+        self.list.appendSlice(self.arena, bytes) catch {
+            self.oom = true;
+            return error.WriteFailed;
+        };
+    }
+
+    /// The error for a failed exchange that wrote here.
+    fn failure(self: *Capped, err: Error, diag: *Diag) Error {
+        if (self.over) return fail(diag, too_large);
+        if (self.oom) return error.OutOfMemory;
+        return err;
+    }
+};
+
 /// `GET {base}/models`: the model ids, sorted.
 pub fn listModels(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, base_url: []const u8, api_key: []const u8, diag: *Diag) Error![]const []const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const status = try exchange(io, gpa, arena, .GET, try endpoint(arena, base_url, "/models"), api_key, null, &out.writer, diag);
+    var out: Capped = .{ .arena = arena };
+    out.init();
+    const status = exchange(io, gpa, arena, .GET, try endpoint(arena, base_url, "/models"), api_key, null, &out.writer, diag) catch |err|
+        return out.failure(err, diag);
     if (status.class() != .success) return failFmt(arena, diag, "Models request returned {d} {s}", .{ @intFromEnum(status), status.phrase() orelse "" });
     const Resp = struct { data: []const struct { id: []const u8 } = &.{} };
-    const parsed = std.json.parseFromSliceLeaky(Resp, arena, out.written(), .{ .ignore_unknown_fields = true }) catch
+    const parsed = std.json.parseFromSliceLeaky(Resp, arena, out.list.items, .{ .ignore_unknown_fields = true }) catch
         return fail(diag, "Parse error: unexpected response from the endpoint");
     if (parsed.data.len == 0) return fail(diag, "No models returned by the endpoint");
     const ids = try arena.alloc([]const u8, parsed.data.len);
@@ -451,11 +531,11 @@ pub fn stripReasoning(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
 /// only costs one extra round-trip.
 pub fn looksLikeReasoning(output: []const u8, input: ?[]const u8) bool {
     const meta = [_][]const u8{
-        "the user wants",          "the user is asking",  "thinking process",      "**analysis:**",
-        "self-correction",         "drafting the",        "**drafting",            "final check against",
-        "**final review",          "**translation strategy", "**breakdown",        "**original text:**",
-        "original text:",          "analyze the input",   "analyzing the input",   "revising the sentences",
-        "here is the corrected",   "here's the corrected", "i need to translate",  "i should translate",
+        "the user wants",        "the user is asking",     "thinking process",    "**analysis:**",
+        "self-correction",       "drafting the",           "**drafting",          "final check against",
+        "**final review",        "**translation strategy", "**breakdown",         "**original text:**",
+        "original text:",        "analyze the input",      "analyzing the input", "revising the sentences",
+        "here is the corrected", "here's the corrected",   "i need to translate", "i should translate",
         "let me translate",
     };
     var score: u8 = 0;
@@ -580,4 +660,31 @@ test "SSE sink: streamed from a reader, deltas as they arrive" {
     try std.testing.expectEqual(@as(usize, 1), c.n);
     try sink.finish();
     try std.testing.expectEqualStrings("A", sink.full.items);
+}
+
+test "SSE sink and response collector refuse oversized answers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var sink: SseSink(void, ignoreChunk) = .{ .arena = arena.allocator(), .ctx = {} };
+    sink.init();
+    const chunk = try arena.allocator().alloc(u8, 64 * 1024);
+    @memset(chunk, 'x');
+    const lines = max_sse_line_bytes / chunk.len + 1;
+    const wrote: anyerror!void = for (0..lines) |_| {
+        sink.writer.writeAll(chunk) catch |err| break err;
+    };
+    try std.testing.expectError(error.WriteFailed, wrote);
+    try std.testing.expect(sink.too_large);
+    try std.testing.expect(!sink.oom);
+
+    var out: Capped = .{ .arena = arena.allocator() };
+    out.init();
+    const total: anyerror!void = for (0..max_response_bytes / chunk.len + 1) |_| {
+        out.writer.writeAll(chunk) catch |err| break err;
+    };
+    try std.testing.expectError(error.WriteFailed, total);
+    try std.testing.expect(out.over);
+    var diag: Diag = .{};
+    try std.testing.expectEqual(error.AiFailed, out.failure(error.AiFailed, &diag));
+    try std.testing.expectEqualStrings(too_large, diag.message);
 }

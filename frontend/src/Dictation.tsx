@@ -10,6 +10,7 @@ import {
   dictationSetLanguage,
   dictationSetProofread,
   openSettings,
+  copyText,
   CAPTION_LANGUAGES,
   PASTE_KEYS,
 } from "./api";
@@ -42,6 +43,14 @@ function envelope(i: number): number {
 export default function Dictation() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [text, setText] = useState("");
+  // An error that kept the dictation (it couldn't be copied): what failed, shown in the hint;
+  // `text` then holds the dictated text, copied with C or a click.
+  const [keptError, setKeptError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const textRef = useRef("");
+  textRef.current = text;
+  const keptRef = useRef("");
+  keptRef.current = keptError;
   const [status, setStatus] = useState<DictationStatus | null>(null);
   // Waveform animation, all DOM-driven (no React re-render at 60 fps):
   const barEls = useRef<(HTMLSpanElement | null)[]>([]);
@@ -102,6 +111,7 @@ export default function Dictation() {
     const un = listen("ghostpen://dictation-show", () => {
       setPhase("listening");
       setText("");
+      setKeptError("");
       refreshStatus();
     });
     refreshStatus();
@@ -161,6 +171,8 @@ export default function Dictation() {
   useEffect(() => {
     const un = listen<DictationUpdate>("ghostpen://dictation", (e) => {
       const u = e.payload;
+      setKeptError(u.state === "error" && u.message ? u.message : "");
+      setCopied(false);
       switch (u.state) {
         case "listening":
           setPhase("listening");
@@ -213,6 +225,15 @@ export default function Dictation() {
     dictationCancel().catch(() => {});
     setPhase("idle");
     setText("");
+    setKeptError("");
+  };
+
+  // Copy the dictation an error kept (nothing else is copyable from the pill).
+  const copyKept = () => {
+    if (!keptRef.current || !textRef.current) return;
+    copyText(textRef.current)
+      .then(() => setCopied(true))
+      .catch((e) => console.warn("copy dictation:", e));
   };
 
   // Esc cancels, Enter finishes (or dismisses a finished/errored overlay), and Space starts
@@ -236,6 +257,9 @@ export default function Dictation() {
             setText(String(e));
           });
         }
+      } else if ((ev.key === "c" || ev.key === "C") && phaseRef.current === "error" && keptRef.current) {
+        ev.preventDefault();
+        copyKept();
       } else if (ev.key === "p" || ev.key === "P") {
         ev.preventDefault();
         toggleProofread();
@@ -262,7 +286,9 @@ export default function Dictation() {
           : phase === "done"
             ? `Copied — press ${PASTE_KEYS} · Space to dictate again · Esc to close`
             : phase === "error"
-              ? "Space to try again · Esc to close"
+              ? keptError
+                ? `${copied ? "Copied" : keptError} — C to copy · Esc to close`
+                : "Space to try again · Esc to close"
               : "";
 
   return (
@@ -335,7 +361,7 @@ export default function Dictation() {
           <div className="dict-actions">
             <button
               className="dict-btn"
-              onClick={() => openSettings()}
+              onClick={() => openSettings().catch((e) => console.warn("open settings:", e))}
               tabIndex={-1}
               onMouseDown={(e) => e.preventDefault()}
               title="Dictation settings"
@@ -364,7 +390,11 @@ export default function Dictation() {
           </div>
         </div>
 
-        <div className={`dict-text ${phase === "error" ? "error" : ""}`}>
+        <div
+          className={`dict-text ${phase === "error" && !keptError ? "error" : ""}`}
+          onClick={keptError ? copyKept : undefined}
+          title={keptError ? "Copy (C)" : undefined}
+        >
           {text ||
             (phase === "listening"
               ? status && !status.model_ready

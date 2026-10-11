@@ -597,10 +597,10 @@ export default function Menu() {
       <header className="menu-head" data-oriel-drag-region>
         <span className="brand">GhostPen</span>
         <span className="head-btns">
-          <button className="icon-btn" title="Playground" onClick={() => openPlayground()}>
+          <button className="icon-btn" title="Playground" onClick={() => openPlayground().catch((e) => console.warn("open playground:", e))}>
             🧪
           </button>
-          <button className="icon-btn" title="Settings" onClick={() => openSettings()}>
+          <button className="icon-btn" title="Settings" onClick={() => openSettings().catch((e) => console.warn("open settings:", e))}>
             ⚙️
           </button>
         </span>

@@ -138,12 +138,29 @@ fn setState(gen: ?u64, s: State) void {
     if (emit) |f| f(own_state);
 }
 
+/// The reading's state now (a window asks on load; updates come by event),
+/// its message and voice copied into `arena` under the lock.
+pub fn statusAlloc(arena: std.mem.Allocator) !State {
+    const st = status();
+    return .{ .phase = st.phase, .message = try arena.dupe(u8, st.message), .voice = try arena.dupe(u8, st.voice) };
+}
+
+/// Per-thread copies of `own_state`'s text: what `status` returns stays put
+/// while another thread changes the state (an IPC thread serializes it
+/// before its next call).
+threadlocal var status_message: [256]u8 = undefined;
+threadlocal var status_voice: [32]u8 = undefined;
+
 /// The reading's state now (a window asks on load; updates come by event).
-/// Valid until the next state change.
+/// Its message and voice are valid until this thread's next `status` call.
 pub fn status() State {
     state_mutex.lockUncancelable(shared_io);
-    const own = own_state;
     const prep = preparing;
+    const own: State = .{
+        .phase = own_state.phase,
+        .message = copyInto(&status_message, own_state.message),
+        .voice = copyInto(&status_voice, own_state.voice),
+    };
     state_mutex.unlock(shared_io);
     if (prep or !ready) return own;
     // Not before the first reading: `oriel.tts.status` loads the GPU backends.
@@ -151,6 +168,12 @@ pub fn status() State {
     const st = tts.status();
     if (!st.speaking) return .{ .phase = "idle", .message = "", .voice = "" };
     return .{ .phase = st.phase, .message = "", .voice = "" };
+}
+
+fn copyInto(buf: []u8, text: []const u8) []const u8 {
+    const n = @min(text.len, buf.len);
+    @memcpy(buf[0..n], text[0..n]);
+    return buf[0..n];
 }
 
 // ---- downloads -----------------------------------------------------------------------------
@@ -264,14 +287,14 @@ pub fn speak(req: Request) void {
         break :blk generation;
     };
     tts.stop();
-    const job = shared_gpa.create(Job) catch return;
+    const job = shared_gpa.create(Job) catch return outOfMemory(gen);
     job.* = .{ .arena = .init(shared_gpa), .req = undefined, .gen = gen };
     const a = job.arena.allocator();
     job.req = .{
-        .text = a.dupe(u8, req.text) catch return dropJob(job),
-        .lang = a.dupe(u8, req.lang) catch return dropJob(job),
-        .voice = a.dupe(u8, req.voice) catch return dropJob(job),
-        .model = a.dupe(u8, req.model) catch return dropJob(job),
+        .text = a.dupe(u8, req.text) catch return dropOutOfMemory(job),
+        .lang = a.dupe(u8, req.lang) catch return dropOutOfMemory(job),
+        .voice = a.dupe(u8, req.voice) catch return dropOutOfMemory(job),
+        .model = a.dupe(u8, req.model) catch return dropOutOfMemory(job),
     };
     const t = std.Thread.spawn(.{}, runJob, .{job}) catch |err| {
         log.err("cannot start the reading: {s}", .{@errorName(err)});
@@ -284,6 +307,18 @@ pub fn speak(req: Request) void {
 fn dropJob(job: *Job) void {
     job.arena.deinit();
     shared_gpa.destroy(job);
+}
+
+/// The reading couldn't even be queued: say so (the UI waits on "tts:state").
+fn outOfMemory(gen: u64) void {
+    log.err("cannot start the reading: out of memory", .{});
+    setState(gen, .{ .phase = "error", .message = "Not enough memory to read this text", .voice = "" });
+}
+
+fn dropOutOfMemory(job: *Job) void {
+    const gen = job.gen;
+    dropJob(job);
+    outOfMemory(gen);
 }
 
 fn setPreparing(on: bool) void {
@@ -328,7 +363,7 @@ fn runJob(job: *Job) void {
 
 fn logResult(r: tts.Result) void {
     log.info("read {s} ({s}) on {s}: first audio {d} ms (load {d} ms), {d} chunks, {d:.1} s of audio in {d} ms{s}", .{
-        r.voice,  r.lang,  r.backend,  r.first_audio_ms, r.load_ms,
+        r.voice,  r.lang,    r.backend,  r.first_audio_ms,                   r.load_ms,
         r.chunks, r.audio_s, r.synth_ms, if (r.stopped) ", stopped" else "",
     });
 }

@@ -74,6 +74,9 @@ pub fn isRunning() bool {
 
 /// A start in progress (device pick, model load): a second toggle is ignored.
 var starting: std.atomic.Value(bool) = .init(false);
+/// Bumped by every stop, even with no session yet: a start that sees it
+/// change (Esc while the model loads) tears its session down.
+var cancel_gen: std.atomic.Value(u64) = .init(0);
 
 const Session = struct {
     running: std.atomic.Value(bool) = .init(true),
@@ -237,10 +240,12 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 /// Start a session; returns the device name (in `arena`). Slow work (device
 /// list, model load, opening the source) runs without holding `mutex`.
+/// error.Cancelled: a stop came meanwhile, nothing is capturing.
 fn start(arena: std.mem.Allocator) ![]const u8 {
     if (isRunning()) return oriel.ipc.fail("Captions are already running.", .{});
     if (starting.swap(true, .acq_rel)) return oriel.ipc.fail("Captions are already starting.", .{});
     defer starting.store(false, .release);
+    const gen = cancel_gen.load(.acquire);
 
     const s = try main.shared.get(main.io, arena);
     const c = s.captions;
@@ -268,6 +273,11 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
     sess.worker_thread = try std.Thread.spawn(.{}, Session.workerLoop, .{sess});
 
     mutex.lockUncancelable(main.io);
+    if (cancel_gen.load(.acquire) != gen) {
+        // Stopped before it was published: the errdefer above destroys it.
+        mutex.unlock(main.io);
+        return error.Cancelled;
+    }
     const old = session;
     session = sess;
     mutex.unlock(main.io);
@@ -279,6 +289,7 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
 /// so the UI never waits for a transcription in flight.
 fn stop() void {
     mutex.lockUncancelable(main.io);
+    _ = cancel_gen.fetchAdd(1, .acq_rel);
     const s = session orelse {
         mutex.unlock(main.io);
         return;
@@ -286,7 +297,10 @@ fn stop() void {
     session = null;
     mutex.unlock(main.io);
     s.running.store(false, .release);
-    if (std.Thread.spawn(.{}, Session.destroy, .{s})) |t| t.detach() else |_| s.destroy();
+    if (std.Thread.spawn(.{}, Session.destroy, .{s})) |t| t.detach() else |err| {
+        log.warn("cannot spawn the stop thread ({s}): stopping on this one", .{@errorName(err)});
+        s.destroy();
+    }
 }
 
 /// Show the overlay with its controls (leave ghost mode), at the bottom.
@@ -324,6 +338,7 @@ fn startFromToggle() void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     _ = start(arena.allocator()) catch |err| {
+        if (err == error.Cancelled) return;
         const msg = if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err);
         App.emit("ghostpen://caption-error", msg);
         return;
@@ -381,8 +396,9 @@ pub const Commands = struct {
         return listDevices(arena, true);
     }
 
+    /// "" when a stop came during the start (quietly not capturing).
     pub fn captions_start(arena: std.mem.Allocator) ![]const u8 {
-        const device = try start(arena);
+        const device = start(arena) catch |err| return if (err == error.Cancelled) "" else err;
         App.runOnMain({}, struct {
             fn show(_: void) void {
                 const w = App.ensureWindow("captions") catch |err| return log.err("captions window: {s}", .{@errorName(err)});

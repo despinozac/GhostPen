@@ -15,6 +15,13 @@ const std = @import("std");
 const fetch_timeout_ms = 10_000;
 /// The document text cap fed to the model (about 30k tokens).
 const max_text_bytes = 120_000;
+/// The HTML read from the site: beyond it the page is cut (articles are far
+/// smaller; this bounds a hostile or endless response).
+const max_html_bytes = 8 * 1024 * 1024;
+/// The title kept from `<title>` (an unclosed one would swallow the page).
+const max_title_bytes = 300;
+/// Redirects followed by hand (each target checked, see `allowedRedirect`).
+const max_redirects = 5;
 
 pub const Page = struct {
     title: []const u8,
@@ -98,7 +105,7 @@ pub fn read(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, url: [
 
     var html_buf: std.Io.Writer.Allocating = .init(gpa);
     defer html_buf.deinit();
-    const status = try fetch(io, gpa, url, &html_buf.writer, diag);
+    const status = try fetch(io, gpa, arena, url, &html_buf.writer, diag);
     switch (status) {
         .ok, .moved_permanently, .found, .multiple_choice => {},
         .not_found => return diagFail(arena, diag, "The page doesn't exist (404): is the link right?", .{}),
@@ -122,46 +129,146 @@ const Timeout = struct {
     }
 };
 
-fn fetch(io: std.Io, gpa: std.mem.Allocator, url: []const u8, sink: *std.Io.Writer, diag: *Diag) Error!std.http.Status {
+fn fetch(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, url: []const u8, sink: *std.Io.Writer, diag: *Diag) Error!std.http.Status {
     const Fetch = struct {
         fn run(i: std.Io, alloc: std.mem.Allocator, u: []const u8, w: *std.Io.Writer) anyerror!std.http.Status {
             var client: std.http.Client = .{ .allocator = alloc, .io = i };
             defer client.deinit();
-            const res = try client.fetch(.{
-                .location = .{ .url = u },
-                .keep_alive = false,
-                .headers = .{
-                    .accept_encoding = .{ .override = "identity" },
-                    .user_agent = .{ .override = "Mozilla/5.0 (X11; Linux x86_64) GhostPen/2.19" },
-                },
-                .response_writer = w,
-            });
-            return res.status;
+            // Redirect targets live here (each resolved against the last).
+            var location_buf: [16 * 1024]u8 = undefined;
+            var aux: []u8 = &location_buf;
+            var uri = try std.Uri.parse(u);
+            var hops: u32 = 0;
+            while (true) : (hops += 1) {
+                var req = try client.request(.GET, uri, .{
+                    // Followed below: a page must not bounce the request to
+                    // this machine or the local network.
+                    .redirect_behavior = .unhandled,
+                    .keep_alive = false,
+                    .headers = .{
+                        .accept_encoding = .{ .override = "identity" },
+                        .user_agent = .{ .override = "Mozilla/5.0 (X11; Linux x86_64) GhostPen/2.19" },
+                    },
+                });
+                defer req.deinit();
+                try req.sendBodiless();
+                var response = try req.receiveHead(&.{});
+                if (response.head.status.class() == .redirect) {
+                    if (hops >= max_redirects) return error.TooManyHttpRedirects;
+                    const loc = response.head.location orelse return error.HttpRedirectLocationMissing;
+                    if (loc.len > aux.len) return error.HttpRedirectLocationOversize;
+                    @memcpy(aux[0..loc.len], loc);
+                    uri = uri.resolveInPlace(loc.len, &aux) catch return error.HttpRedirectLocationInvalid;
+                    if (!try allowedRedirect(i, uri)) return error.RedirectToPrivateAddress;
+                    continue;
+                }
+                return readBody(alloc, &response, w);
+            }
         }
     };
     const Outcome = union(enum) { done: anyerror!std.http.Status, timeout: void };
     var buf: [2]Outcome = undefined;
     var sel = std.Io.Select(Outcome).init(io, &buf);
-    sel.concurrent(.done, Fetch.run, .{ io, gpa, url, sink }) catch return diagFail(gpa, diag, "Could not start the request.", .{});
+    sel.concurrent(.done, Fetch.run, .{ io, gpa, url, sink }) catch return diagFail(arena, diag, "Could not start the request.", .{});
     // The fetch points into this frame: never return while it may still run.
     sel.concurrent(.timeout, Timeout.sleep, .{ io, fetch_timeout_ms }) catch {
         sel.cancelDiscard();
-        return diagFail(gpa, diag, "Could not start the request.", .{});
+        return diagFail(arena, diag, "Could not start the request.", .{});
     };
     const first = sel.await() catch {
         sel.cancelDiscard();
-        return diagFail(gpa, diag, "Request cancelled.", .{});
+        return diagFail(arena, diag, "Request cancelled.", .{});
     };
     sel.cancelDiscard();
     return switch (first) {
-        .timeout => diagFail(gpa, diag, "The page took too long (10 s): is the site reachable?", .{}),
+        .timeout => diagFail(arena, diag, "The page took too long (10 s): is the site reachable?", .{}),
         .done => |r| r catch |err| switch (err) {
-            error.ConnectionRefused, error.UnknownHostName, error.NetworkUnreachable, error.HostUnreachable, error.ConnectionResetByPeer, error.ConnectionTimedOut => diagFail(gpa, diag, "Could not connect to the site.", .{}),
-            error.UnsupportedUriScheme, error.UriMissingHost, error.InvalidFormat, error.UnexpectedCharacter, error.InvalidPort => diagFail(gpa, diag, "The link is not valid.", .{}),
+            error.ConnectionRefused, error.UnknownHostName, error.NetworkUnreachable, error.HostUnreachable, error.ConnectionResetByPeer, error.ConnectionTimedOut => diagFail(arena, diag, "Could not connect to the site.", .{}),
+            error.UnsupportedUriScheme, error.UriMissingHost, error.InvalidFormat, error.UnexpectedCharacter, error.InvalidPort => diagFail(arena, diag, "The link is not valid.", .{}),
+            error.RedirectToPrivateAddress => diagFail(arena, diag, "The site redirected to a local or private address: not followed.", .{}),
+            error.TooManyHttpRedirects => diagFail(arena, diag, "The site redirected too many times.", .{}),
             error.OutOfMemory => error.OutOfMemory,
-            else => diagFail(gpa, diag, "The request failed ({s}).", .{@errorName(err)}),
+            else => diagFail(arena, diag, "The request failed ({s}).", .{@errorName(err)}),
         },
     };
+}
+
+/// The response body into `w`, decompressed, cut at `max_html_bytes`.
+fn readBody(alloc: std.mem.Allocator, response: *std.http.Client.Response, w: *std.Io.Writer) anyerror!std.http.Status {
+    const status = response.head.status;
+    const window: usize = switch (response.head.content_encoding) {
+        .identity => 0,
+        .zstd => std.compress.zstd.default_window_len,
+        .deflate, .gzip => std.compress.flate.max_window_len,
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    const decompress_buf = try alloc.alloc(u8, window);
+    defer alloc.free(decompress_buf);
+    var transfer_buf: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
+    var left: usize = max_html_bytes;
+    while (left > 0) {
+        const n = reader.stream(w, .limited(left)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+            error.WriteFailed => return error.WriteFailed,
+        };
+        left -= n;
+    }
+    // Past the cap the rest is dropped: what was read still extracts.
+    return status;
+}
+
+/// A redirect target may not be this machine or a private network (the
+/// first URL is the user's choice; where a site sends it is not). Names are
+/// resolved and every address checked. (A name that resolves differently
+/// at the connect is not caught; this stops the plain cases.)
+fn allowedRedirect(io: std.Io, uri: std.Uri) !bool {
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_buf);
+    const name = std.mem.trim(u8, host.bytes, "[]");
+    if (std.ascii.eqlIgnoreCase(name, "localhost") or std.ascii.endsWithIgnoreCase(name, ".localhost")) return false;
+    if (std.Io.net.IpAddress.parse(name, 0)) |addr| return !isPrivate(addr) else |_| {}
+    // Not a literal: no ':' belongs in a name (a scoped IPv6 literal lands here).
+    if (std.mem.indexOfScalar(u8, name, ':') != null) return false;
+    var results_buf: [32]std.Io.net.HostName.LookupResult = undefined;
+    var results: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&results_buf);
+    try host.lookup(io, &results, .{ .port = 0 });
+    var any = false;
+    while (results.getOne(io)) |r| switch (r) {
+        .address => |a| {
+            if (isPrivate(a)) return false;
+            any = true;
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+        error.Canceled => |e| return e,
+    }
+    return any;
+}
+
+/// Loopback, unspecified, private (RFC 1918, ULA), CGNAT and link-local.
+fn isPrivate(addr: std.Io.net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a| privateIp4(a.bytes),
+        .ip6 => |a| blk: {
+            const b = a.bytes;
+            const zero10 = std.mem.allEqual(u8, b[0..10], 0);
+            if (zero10 and std.mem.allEqual(u8, b[10..15], 0) and b[15] <= 1) break :blk true; // :: and ::1
+            if (zero10 and b[10] == 0xff and b[11] == 0xff) break :blk privateIp4(b[12..16].*); // v4-mapped
+            break :blk (b[0] & 0xfe) == 0xfc or (b[0] == 0xfe and (b[1] & 0xc0) == 0x80);
+        },
+    };
+}
+
+fn privateIp4(b: [4]u8) bool {
+    return b[0] == 0 or b[0] == 10 or b[0] == 127 or
+        (b[0] == 169 and b[1] == 254) or
+        (b[0] == 172 and (b[1] & 0xf0) == 16) or
+        (b[0] == 192 and b[1] == 168) or
+        (b[0] == 100 and (b[1] & 0xc0) == 64);
 }
 
 // ---- the HTML-to-text extraction --------------------------------------------------------
@@ -213,7 +320,9 @@ pub fn extract(arena: std.mem.Allocator, html: []const u8) !Page {
             const run_end = std.mem.indexOfScalarPos(u8, html, i, '<') orelse html.len;
             const run = html[i..run_end];
             if (in_title) {
-                _ = try decode(run, &title.writer);
+                // An unclosed <title> runs to the end: keep its start only.
+                const room = max_title_bytes -| title.written().len;
+                if (room > 0) _ = try decode(run[0..@min(run.len, room)], &title.writer);
             } else if (!isBlank(run)) {
                 _ = try decode(run, &body.writer);
             }
@@ -469,6 +578,32 @@ test "a title-less page falls back to the first link's host" {
     const page = try extract(arena, "<div>No title here</div><p>first https://example.com/docs/article one</p>");
     try std.testing.expectEqualStrings("example.com", page.title);
     try std.testing.expectEqualStrings("No title here\n\nfirst https://example.com/docs/article one", page.text);
+}
+
+test "an unclosed title is capped" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const html = "<title>" ++ "word " ** 1000;
+    const page = try extract(arena, html);
+    try std.testing.expect(page.title.len <= max_title_bytes + 8);
+}
+
+test "redirect targets: private and loopback addresses are refused" {
+    const P = std.Io.net.IpAddress;
+    try std.testing.expect(isPrivate(try P.parse("127.0.0.1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("10.1.2.3", 0)));
+    try std.testing.expect(isPrivate(try P.parse("172.20.0.1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("192.168.1.1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("169.254.169.254", 0)));
+    try std.testing.expect(isPrivate(try P.parse("0.0.0.0", 0)));
+    try std.testing.expect(isPrivate(try P.parse("::1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("fe80::1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("fd00::1", 0)));
+    try std.testing.expect(isPrivate(try P.parse("::ffff:127.0.0.1", 0)));
+    try std.testing.expect(!isPrivate(try P.parse("93.184.216.34", 0)));
+    try std.testing.expect(!isPrivate(try P.parse("172.32.0.1", 0)));
+    try std.testing.expect(!isPrivate(try P.parse("2606:4700::1", 0)));
 }
 
 test "entities decode, unknown ones stay" {

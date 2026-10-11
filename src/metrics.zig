@@ -149,10 +149,12 @@ pub fn snapshot(io: std.Io, arena: std.mem.Allocator) Snapshot {
     };
 }
 
-fn dupeInfo(arena: std.mem.Allocator, info: Info) !Info {
+fn dupeInfo(allocator: std.mem.Allocator, info: Info) !Info {
+    const model = try allocator.dupe(u8, info.model);
+    errdefer allocator.free(model);
     return .{
-        .model = try arena.dupe(u8, info.model),
-        .gpu = try arena.dupe(u8, info.gpu),
+        .model = model,
+        .gpu = try allocator.dupe(u8, info.gpu),
         .ctx = info.ctx,
         .load_ms = info.load_ms,
     };

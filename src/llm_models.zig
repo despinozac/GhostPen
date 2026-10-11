@@ -186,8 +186,8 @@ pub fn resolve(io: std.Io, arena: std.mem.Allocator, d: Dirs, model: []const u8)
         // Only a GGUF in one of the model folders (the setting comes from the page).
         const p = model["file:".len..];
         if (!std.ascii.endsWithIgnoreCase(p, ".gguf") or std.mem.indexOf(u8, p, "..") != null) return null;
-        var inside = std.mem.startsWith(u8, p, d.own);
-        for (d.others) |root| inside = inside or std.mem.startsWith(u8, p, root);
+        var inside = insideDir(io, arena, p, d.own);
+        for (d.others) |root| inside = inside or insideDir(io, arena, p, root);
         if (!inside) return null;
         std.Io.Dir.cwd().access(io, p, .{}) catch return null;
         return p;
@@ -197,6 +197,24 @@ pub fn resolve(io: std.Io, arena: std.mem.Allocator, d: Dirs, model: []const u8)
     if (std.Io.Dir.cwd().access(io, own, .{})) |_| return own else |_| {}
     for (d.others) |root| if (findFile(io, arena, root, e.file)) |p| return p;
     return null;
+}
+
+/// `path`'s folder, resolved (symlinks and all), is `root` or below it.
+/// (The file itself may be a link: other apps' folders hold some.)
+fn insideDir(io: std.Io, arena: std.mem.Allocator, path: []const u8, root: []const u8) bool {
+    if (root.len == 0) return false;
+    const dir = std.fs.path.dirname(path) orelse return false;
+    const real_dir = std.Io.Dir.cwd().realPathFileAlloc(io, dir, arena) catch return false;
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, arena) catch return false;
+    return within(real_dir, real_root);
+}
+
+/// `path` is `root` or inside it: a prefix match that ends at a separator
+/// ("/models-evil" is not inside "/models").
+fn within(path: []const u8, root: []const u8) bool {
+    const r = std.mem.trimEnd(u8, root, "/\\");
+    if (!std.mem.startsWith(u8, path, r)) return false;
+    return path.len == r.len or std.fs.path.isSep(path[r.len]);
 }
 
 pub const ModelState = struct {
@@ -425,7 +443,7 @@ fn fetchFile(
             r.interface.toss(chunk.len);
         }
         if (have > e.size) {
-            std.Io.Dir.cwd().deleteFile(io, part) catch {};
+            deleteIfThere(io, part);
             hasher = .init(.{});
             have = 0;
         }
@@ -476,7 +494,7 @@ fn fetchFile(
                     // The server won't resume this file: start over next time.
                     file.close(io);
                     closed = true;
-                    std.Io.Dir.cwd().deleteFile(io, part) catch {};
+                    deleteIfThere(io, part);
                 }
                 return err;
             },
@@ -490,7 +508,7 @@ fn fetchFile(
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, &hex, e.sha256)) {
-        std.Io.Dir.cwd().deleteFile(io, part) catch {};
+        deleteIfThere(io, part);
         return error.ChecksumMismatch;
     }
     try std.Io.Dir.cwd().rename(part, std.Io.Dir.cwd(), final, io);
@@ -614,6 +632,12 @@ fn Sink(comptime Ctx: type, comptime on_progress: fn (Ctx, Progress) void) type 
                 return error.WriteFailed;
             }
             if (bytes.len == 0) return;
+            // More than the catalog's size: never let a server fill the disk.
+            if (self.pos + bytes.len > self.total) {
+                log.warn("{s}: the server sent more than the expected {d} bytes", .{ self.id, self.total });
+                self.failed = true;
+                return error.WriteFailed;
+            }
             self.file.writePositionalAll(self.io, bytes, self.pos) catch {
                 self.failed = true;
                 return error.WriteFailed;
@@ -636,12 +660,21 @@ pub fn remove(io: std.Io, arena: std.mem.Allocator, d: Dirs, id: []const u8) !vo
     if (!beginExclusive()) return error.Busy;
     defer endExclusive();
     const final = try std.fs.path.join(arena, &.{ d.own, e.file });
-    std.Io.Dir.cwd().deleteFile(io, final) catch {};
-    std.Io.Dir.cwd().deleteFile(io, try std.fmt.allocPrint(arena, "{s}.part", .{final})) catch {};
+    deleteIfThere(io, final);
+    deleteIfThere(io, try std.fmt.allocPrint(arena, "{s}.part", .{final}));
     // Its image projector too.
     const pj = try std.fs.path.join(arena, &.{ d.own, try projectorName(arena, e.file) });
-    std.Io.Dir.cwd().deleteFile(io, pj) catch {};
-    std.Io.Dir.cwd().deleteFile(io, try std.fmt.allocPrint(arena, "{s}.part", .{pj})) catch {};
+    deleteIfThere(io, pj);
+    deleteIfThere(io, try std.fmt.allocPrint(arena, "{s}.part", .{pj}));
+}
+
+/// Delete `path`; a missing file is fine, any other failure is logged (a
+/// file left behind is resumed or listed again later).
+fn deleteIfThere(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => log.warn("could not delete {s}: {s}", .{ path, @errorName(err) }),
+    };
 }
 
 test "catalog ids and hashes" {
@@ -691,4 +724,42 @@ test resolve {
     // file: only for GGUFs inside the model folders.
     try std.testing.expect(resolve(io, a, d, try std.fmt.allocPrint(a, "file:{s}", .{found})) != null);
     try std.testing.expect(resolve(io, a, d, "file:/etc/passwd") == null);
+    // A sibling folder sharing the root's prefix is not inside it.
+    try tmp.dir.createDirPath(io, "lms-evil");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lms-evil/x.gguf", .data = "GGUF" });
+    try std.testing.expect(resolve(io, a, d, try std.fmt.allocPrint(a, "file:{s}/lms-evil/x.gguf", .{base})) == null);
+}
+
+test within {
+    try std.testing.expect(within("/m/models", "/m/models"));
+    try std.testing.expect(within("/m/models/a", "/m/models"));
+    try std.testing.expect(within("/m/models/a", "/m/models/"));
+    try std.testing.expect(!within("/m/models-evil", "/m/models"));
+    try std.testing.expect(!within("/m/mod", "/m/models"));
+}
+
+test "Sink refuses more bytes than the expected total" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "x.part", .{ .read = true });
+    defer file.close(io);
+    var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
+    const Noop = struct {
+        fn f(_: void, _: Progress) void {}
+    };
+    var sink: Sink(void, Noop.f) = .{
+        .io = io,
+        .file = file,
+        .pos = 0,
+        .hasher = &hasher,
+        .id = "test",
+        .total = 8,
+        .ctx = {},
+        .last = .now(io, .awake),
+    };
+    sink.init();
+    try sink.put("12345678");
+    try std.testing.expectError(error.WriteFailed, sink.put("9"));
+    try std.testing.expect(sink.failed);
 }

@@ -132,7 +132,9 @@ function inline(text: string): string {
     return `\u0000${codes.length - 1}\u0000`;
   });
   s = s
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    // Only web links get an href (no javascript:, data:, file:…); others keep their text.
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, label: string, href: string) =>
+      /^https?:\/\//i.test(href) ? `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>` : label)
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|\s)\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
     .replace(/(^|\s)_([^_\s][^_]*)_([^_\s]|$)/g, "$1<em>$2</em>$3")

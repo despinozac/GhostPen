@@ -4,6 +4,33 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-10-11
+
+### Changed
+
+- Built on Oriel 0.9.16 (the framework's Power of 10 review: script time and memory limits, storage caps, per-window bridge checks).
+- The model & speech service (port 8771) no longer answers web browsers: a request with an `Origin` header, or a `Host` other than the loopback address it listens on, gets 403, and JSON routes require `Content-Type: application/json` (415 otherwise). A web page could reach it before: load and unload models, run ffmpeg on its bytes, crash the app with a `keep_alive` value, and with DNS rebinding read the answers.
+- The service takes at most 16 connections, cuts off clients that stall sending a request (30 s for the head, 5 min for a body), queues at most 4 chat and 4 embedding requests, takes at most 256 embedding inputs, and answers oversized bodies with 413 instead of dropping the connection. ffmpeg reads uploads from the pipe only (a playlist can't make it open files or URLs) and stops at the 3 hours the whisper runner accepts.
+- Dictation sessions finish on their own after 10 minutes, and the live transcript re-reads only the last 30 s (the final pass still reads all of it).
+- A finished dictation waits up to 5 s for a running menu action; if it is still busy, the pill keeps the text to copy (`C`) instead of losing it.
+- Settings saves only the fields edited in the window, on top of the current settings: the pill's language and the captions' translation toggles are no longer reverted by an older Settings window. The window shows an error with Try again when settings can't be loaded.
+
+### Fixed
+
+- Summarize link: the page title and error shown in the summary window pointed at freed memory (garbage or a crash when the window was reopened).
+- Esc while dictation or captions were still starting (the model loading) didn't stop them: the microphone or system audio kept recording behind a hidden window, and the next hotkey pasted it.
+- Links in summaries open in the browser and only for `http(s)` (a `javascript:` link written by a prompt-injected page is shown as text).
+- `keep_alive` values like `1e300`, `"inf"` or `1e17` crashed the app (overflow); they are capped at 24 h.
+- Text containing a model's control tokens (`<|im_end|><|im_start|>system…`, from a web page or the clipboard) no longer becomes real turn markers.
+- The prompt cache could reuse the wrong tokens after a cancelled or failed prompt read, giving answers from the wrong context.
+- MoE models with more than 128 blocks overflowed the expert-offload table; tiny models divided by zero.
+- A clipboard image whose header claims a huge size (e.g. 40000×40000) is refused before decoding (over 50 megapixels).
+- Size caps: web pages (8 MB), endpoint answers (16 MB, 1 MB per streamed line), downloads past their expected size, unclosed page titles. Redirects in Summarize link can't lead to loopback or private addresses.
+- A hung whisper runner no longer blocks dictation and captions forever: replies have a deadline, then the runner is restarted.
+- A dropped streaming client stops the generation; the discovery file is written atomically; `file:` model paths must be inside a models folder (`/models-evil` is not inside `/models`).
+- Settings values are kept in range when loaded or saved (context size, MoE %, OCR size, caption chunk length, temperature, …).
+- Read-aloud status could return text another thread was overwriting; small leaks and silently dropped errors.
+
 ## [0.2.22] - 2026-10-09
 
 ### Added

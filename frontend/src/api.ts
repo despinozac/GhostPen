@@ -238,9 +238,9 @@ export const openPlayground = () => invoke<void>("open_playground");
 /** Hide the window this page runs in (Oriel: the window API, no command). */
 export const hideWindow = () => orielWindow.current().hide();
 /** Close the menu without pasting: the clipboard gets back what it held before the trigger. */
-export const dismissMenu = () => {
-  invoke<void>("menu_dismissed").catch(() => {});
-  return hideWindow();
+export const dismissMenu = (): Promise<void> => {
+  invoke<void>("menu_dismissed").catch((e) => console.warn("menu_dismissed:", e));
+  return hideWindow().catch((e) => console.warn("hide the menu:", e));
 };
 export const openSettings = () => invoke<void>("open_settings");
 
@@ -293,6 +293,8 @@ export interface DictationUpdate {
   text: string;
   /** listening | transcribing | proofreading | done | cancelled | error */
   state: string;
+  /** An error that kept the dictation: `text` is the dictated text (to copy), this says what failed. */
+  message?: string;
 }
 
 /** Microphone candidates for the Settings picker (no monitor/loopback sources). */

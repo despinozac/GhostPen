@@ -175,10 +175,10 @@ export default function Captions() {
             <button className="cap-btn" onClick={enterGhost} title="Click-through (mouse passes through)">
               👻 Ghost
             </button>
-            <button className="cap-btn" onClick={() => openSettings()} title="Captions settings">
+            <button className="cap-btn" onClick={() => openSettings().catch((e) => console.warn("open settings:", e))} title="Captions settings">
               ⚙
             </button>
-            <button className="cap-btn" onClick={() => hideWindow()} title="Hide overlay">
+            <button className="cap-btn" onClick={() => hideWindow().catch((e) => console.warn("hide captions:", e))} title="Hide overlay">
               ✕
             </button>
           </span>

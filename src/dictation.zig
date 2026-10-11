@@ -21,6 +21,13 @@ const gpa = std.heap.smp_allocator;
 
 const rate = models.sample_rate;
 const read_chunk = rate / 10;
+/// A session finishes on its own after 10 minutes (memory and the final
+/// pass stay bounded).
+const max_samples = rate * 60 * 10;
+/// Live passes re-transcribe only the newest 30 s (the final pass reads all).
+const live_window = rate * 30;
+/// How long a finished dictation waits for a menu action to free the clipboard.
+const busy_wait_ms = 5000;
 
 /// Guards `current` and `latest` (never held across slow work).
 var mutex: std.Io.Mutex = .init;
@@ -28,6 +35,9 @@ var current: ?*Session = null;
 var latest: ?*Session = null;
 /// A start in progress (device pick, model load): a second toggle is ignored.
 var starting: std.atomic.Value(bool) = .init(false);
+/// Bumped by every stop/cancel, even with no session yet: a start that sees
+/// it change (Esc while the model loads) tears its session down.
+var cancel_gen: std.atomic.Value(u64) = .init(0);
 /// Live values the overlay can change mid-session.
 var proofread_live: std.atomic.Value(bool) = .init(true);
 var language_mutex: std.Io.Mutex = .init;
@@ -66,6 +76,12 @@ fn update(text: []const u8, state: []const u8) void {
     App.emit("ghostpen://dictation", .{ .text = text, .state = state });
 }
 
+/// An error that keeps the dictated text: the pill shows `message` and
+/// offers `text` to copy.
+fn updateKeep(text: []const u8, message: []const u8) void {
+    App.emit("ghostpen://dictation", .{ .text = text, .state = "error", .message = message });
+}
+
 const Session = struct {
     refs: std.atomic.Value(u32),
     /// Capture on; cleared by stop/cancel, or when the microphone fails.
@@ -76,6 +92,8 @@ const Session = struct {
     finalize: std.atomic.Value(bool) = .init(true),
     /// 0 opening the microphone, 1 open, 2 failed (start() waits for it).
     opened: std.atomic.Value(u8) = .init(0),
+    /// Listening stopped at `max_samples` (finalized like a stop).
+    capped: std.atomic.Value(bool) = .init(false),
     buf_mutex: std.Io.Mutex = .init,
     samples: std.ArrayList(f32) = .empty,
     source: ?[:0]u8,
@@ -104,9 +122,15 @@ const Session = struct {
     }
 
     fn snapshot(s: *Session) ![]f32 {
+        return s.snapshotTail(std.math.maxInt(usize));
+    }
+
+    /// The newest `max` samples (all of them when fewer). Caller frees.
+    fn snapshotTail(s: *Session, max: usize) ![]f32 {
         s.buf_mutex.lockUncancelable(main.io);
         defer s.buf_mutex.unlock(main.io);
-        return gpa.dupe(f32, s.samples.items);
+        const items = s.samples.items;
+        return gpa.dupe(f32, items[items.len -| max..]);
     }
 
     fn len(s: *Session) usize {
@@ -115,10 +139,23 @@ const Session = struct {
         return s.samples.items.len;
     }
 
+    /// Stops listening (the worker then finalizes) at the length cap or
+    /// when the buffer can't grow.
     fn append(s: *Session, part: []const f32) void {
         s.buf_mutex.lockUncancelable(main.io);
         defer s.buf_mutex.unlock(main.io);
-        s.samples.appendSlice(gpa, part) catch {};
+        if (!s.listening.load(.acquire)) return;
+        const room = max_samples -| s.samples.items.len;
+        s.samples.appendSlice(gpa, part[0..@min(part.len, room)]) catch {
+            log.err("out of memory after {d} s of audio: finishing", .{s.samples.items.len / rate});
+            s.listening.store(false, .release);
+            return;
+        };
+        if (part.len >= room) {
+            log.info("dictation reached {d} min: finishing", .{max_samples / rate / 60});
+            s.capped.store(true, .release);
+            s.listening.store(false, .release);
+        }
     }
 
     /// Opens, reads and closes the microphone on this thread (WASAPI/COM
@@ -162,7 +199,7 @@ const Session = struct {
         }
     }
 
-    /// Re-transcribe the whole utterance while listening (each time a
+    /// Re-transcribe the newest `live_window` while listening (each time a
     /// second of new audio arrived), then finalize or report the cancel.
     /// Holds its own reference, released at the end.
     fn workerLoop(s: *Session) void {
@@ -173,7 +210,7 @@ const Session = struct {
             const n = s.len();
             if (n < rate or n < last_len + rate) continue;
             last_len = n;
-            const samples = s.snapshot() catch continue;
+            const samples = s.snapshotTail(live_window) catch continue;
             defer gpa.free(samples);
             var lang_buf: [16]u8 = undefined;
             const raw = models.transcribe(main.io, gpa, s.model, samples, language(&lang_buf), false) catch |err| {
@@ -191,6 +228,7 @@ const Session = struct {
 
         if (s.aborted.load(.acquire)) return;
         if (!s.finalize.load(.acquire)) return update("", "cancelled");
+        if (s.capped.load(.acquire)) update("Reached the 10-minute limit: finishing\u{2026}", "transcribing");
         s.finalizeSession();
     }
 
@@ -225,8 +263,14 @@ const Session = struct {
         } else transcript;
         if (s.aborted.load(.acquire)) return;
 
-        // Shares the menu's busy guard so clipboard writes can't interleave.
-        if (main.busy.swap(true, .acq_rel)) return update("Another action is still running.", "error");
+        // Shares the menu's busy guard so clipboard writes can't interleave:
+        // waits a few seconds for a menu action, else keeps the text to copy.
+        var waited: u32 = 0;
+        while (main.busy.swap(true, .acq_rel)) : (waited += 50) {
+            if (s.aborted.load(.acquire)) return;
+            if (waited >= busy_wait_ms) return updateKeep(final, "Another action is still running: nothing was copied.");
+            main.io.sleep(.fromMilliseconds(50), .awake) catch return updateKeep(final, "Nothing was copied.");
+        }
         defer main.busy.store(false, .release);
         const settings = main.shared.get(main.io, arena.allocator()) catch main.Settings{};
         if (settings.dictation.paste) {
@@ -269,10 +313,12 @@ pub fn isRunning() bool {
 
 /// Start listening; returns the device name (in `arena`). Slow work (device
 /// list, model load, opening the microphone) runs without holding `mutex`.
+/// error.Cancelled: a stop/cancel came meanwhile, nothing is listening.
 fn start(arena: std.mem.Allocator) ![]const u8 {
     if (isRunning()) return oriel.ipc.fail("Dictation is already running.", .{});
     if (starting.swap(true, .acq_rel)) return oriel.ipc.fail("Dictation is already starting.", .{});
     defer starting.store(false, .release);
+    const gen = cancel_gen.load(.acquire);
 
     const s = try main.shared.get(main.io, arena);
     const model = s.captions.model;
@@ -317,6 +363,14 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
 
     mutex.lockUncancelable(main.io);
     defer mutex.unlock(main.io);
+    if (cancel_gen.load(.acquire) != gen) {
+        // Stopped before it was listening: the worker joins the threads and
+        // goes silent; start()'s reference goes with the defer above.
+        sess.finalize.store(false, .release);
+        sess.aborted.store(true, .release);
+        sess.listening.store(false, .release);
+        return error.Cancelled;
+    }
     // A previous session still finalizing: the user moved on, silence it.
     if (latest) |old| {
         old.aborted.store(true, .release);
@@ -333,6 +387,7 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
 fn end(finalize: bool) void {
     mutex.lockUncancelable(main.io);
     defer mutex.unlock(main.io);
+    _ = cancel_gen.fetchAdd(1, .acq_rel);
     if (!finalize) if (latest) |s| {
         s.finalize.store(false, .release);
         s.aborted.store(true, .release);
@@ -363,8 +418,9 @@ pub fn toggle() void {
 fn startFromToggle() void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    _ = start(arena.allocator()) catch |err| {
-        update(if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err), "error");
+    _ = start(arena.allocator()) catch |err| switch (err) {
+        error.Cancelled => update("", "cancelled"),
+        else => update(if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err), "error"),
     };
 }
 
@@ -386,8 +442,13 @@ pub const Commands = struct {
         };
     }
 
+    /// "" when a stop/cancel came during the start (quietly not listening).
     pub fn dictation_start(arena: std.mem.Allocator) ![]const u8 {
-        const device = try start(arena);
+        const device = start(arena) catch |err| {
+            if (err != error.Cancelled) return err;
+            update("", "cancelled");
+            return "";
+        };
         App.runOnMain({}, struct {
             fn show(_: void) void {
                 showOverlay();

@@ -50,7 +50,7 @@ const gpa = std.heap.smp_allocator;
 
 pub const Reply = struct { status: std.http.Status = .ok, body: []const u8, content_type: []const u8 = "application/json" };
 
-fn errorReply(status: std.http.Status, message: []const u8, arena: std.mem.Allocator) Reply {
+pub fn errorReply(status: std.http.Status, message: []const u8, arena: std.mem.Allocator) Reply {
     const body = std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{ .message = message, .type = "invalid_request_error" } }, .{}) catch "{}";
     return .{ .status = status, .body = body };
 }
@@ -191,33 +191,44 @@ fn requestedCtx(obj: std.json.ObjectMap) ?u32 {
     };
 }
 
+/// The longest `keep_alive` honored: a day keeps a runner as good as
+/// forever, and the client's number can't overflow the arithmetic.
+const max_keep_alive_ms: u64 = 24 * 60 * 60 * 1000;
+
 /// A request's `keep_alive` in milliseconds (null: the runner's default).
 fn keepAliveMs(obj: std.json.ObjectMap) ?u64 {
     const v = obj.get("keep_alive") orelse return null;
     return switch (v) {
-        .integer => |n| if (n < 0) null else @as(u64, @intCast(n)) * 1000,
-        .float => |f| if (f < 0) null else @intFromFloat(f * 1000),
+        .integer => |n| if (n < 0) null else @min(std.math.mul(u64, @intCast(n), 1000) catch max_keep_alive_ms, max_keep_alive_ms),
+        .float => |f| scaledMs(f, 1000),
         .string => |t| parseDuration(t),
         else => null,
     };
+}
+
+/// `n` units of `unit_ms` as milliseconds, at most a day; null when
+/// negative, NaN or infinite.
+fn scaledMs(n: f64, unit_ms: f64) ?u64 {
+    if (!std.math.isFinite(n) or n < 0) return null;
+    const ms = n * unit_ms;
+    if (ms >= @as(f64, @floatFromInt(max_keep_alive_ms))) return max_keep_alive_ms;
+    return @intFromFloat(ms);
 }
 
 /// "30s", "5m", "1h", "250ms" or plain seconds; null when negative or unreadable.
 fn parseDuration(text: []const u8) ?u64 {
     const t = std.mem.trim(u8, text, " ");
     if (t.len == 0 or t[0] == '-') return null;
-    const units = [_]struct { suffix: []const u8, ms: u64 }{
+    const units = [_]struct { suffix: []const u8, ms: f64 }{
         .{ .suffix = "ms", .ms = 1 },
         .{ .suffix = "s", .ms = 1000 },
         .{ .suffix = "m", .ms = 60_000 },
         .{ .suffix = "h", .ms = 3_600_000 },
     };
     for (units) |u| if (std.mem.endsWith(u8, t, u.suffix)) {
-        const n = std.fmt.parseFloat(f64, t[0 .. t.len - u.suffix.len]) catch return null;
-        return @intFromFloat(n * @as(f64, @floatFromInt(u.ms)));
+        return scaledMs(std.fmt.parseFloat(f64, t[0 .. t.len - u.suffix.len]) catch return null, u.ms);
     };
-    const n = std.fmt.parseFloat(f64, t) catch return null;
-    return @intFromFloat(n * 1000);
+    return scaledMs(std.fmt.parseFloat(f64, t) catch return null, 1000);
 }
 
 // ---- /unload --------------------------------------------------------------------------
@@ -248,6 +259,11 @@ pub fn unloadReply(io: std.Io, arena: std.mem.Allocator, body: []const u8) !Repl
 
 // ---- /v1/embeddings -----------------------------------------------------------------
 
+/// Texts and bytes one embeddings request may carry: the runner embeds them
+/// one by one, holding the embedding model the whole time.
+const max_embed_inputs = 256;
+const max_embed_bytes = 4 * 1024 * 1024;
+
 pub fn embeddingsReply(io: std.Io, arena: std.mem.Allocator, body: []const u8) !Reply {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return errorReply(.bad_request, "the body isn't JSON", arena);
     const obj = switch (parsed) {
@@ -265,6 +281,10 @@ pub fn embeddingsReply(io: std.Io, arena: std.mem.Allocator, body: []const u8) !
         else => return errorReply(.bad_request, "input must be a string or strings", arena),
     }
     if (texts.items.len == 0) return errorReply(.bad_request, "input is empty", arena);
+    if (texts.items.len > max_embed_inputs) return errorReply(.bad_request, std.fmt.comptimePrint("too many inputs ({d} at most)", .{max_embed_inputs}), arena);
+    var total: usize = 0;
+    for (texts.items) |t| total += t.len;
+    if (total > max_embed_bytes) return errorReply(.payload_too_large, "the inputs are too large (4 MB at most)", arena);
 
     var why: []const u8 = "";
     const cfg = config(arena, null, &why) orelse return errorReply(.service_unavailable, why, arena);
@@ -331,28 +351,58 @@ fn parseChat(arena: std.mem.Allocator, body: []const u8, err: *[]const u8) !?Cha
 
     // Tools (unless tool_choice is "none").
     const tools: []const std.json.Value = if (obj.get("tools")) |t| (if (t == .array) t.array.items else &.{}) else &.{};
-    var choice: ToolChoice = .auto;
-    if (obj.get("tool_choice")) |tc| switch (tc) {
-        .string => |c| choice = if (std.mem.eql(u8, c, "none")) .none else if (std.mem.eql(u8, c, "required")) .required else .auto,
-        .object => |o| if (o.get("function")) |f| if (f == .object) if (f.object.get("name")) |n| if (n == .string) {
-            choice = .{ .function = n.string };
-        },
-        else => {},
-    };
+    const choice = toolChoice(obj);
     const use_tools = tools.len > 0 and choice != .none;
 
+    const folded = try foldMessages(arena, messages, use_tools, err) orelse return null;
+    var chat: local_llm.Chat = .{ .system = folded.system, .user = folded.user, .image = folded.image };
+    try applyOptions(arena, obj, &chat);
+    if (use_tools) {
+        chat.schema = try toolSchema(arena, tools, choice);
+        const guide = try toolGuide(arena, tools, choice);
+        chat.system = if (chat.system.len > 0) try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ chat.system, guide }) else guide;
+    }
+    const stream = if (obj.get("stream")) |s| s == .bool and s.bool else false;
+    var include_usage = false;
+    if (obj.get("stream_options")) |so| if (so == .object) if (so.object.get("include_usage")) |iu| {
+        include_usage = iu == .bool and iu.bool;
+    };
+    const requested = if (obj.get("model")) |m| (if (m == .string and m.string.len > 0) m.string else null) else null;
+    return .{ .chat = chat, .model = requested, .stream = stream, .include_usage = include_usage, .tools = use_tools };
+}
+
+fn toolChoice(obj: std.json.ObjectMap) ToolChoice {
+    const tc = obj.get("tool_choice") orelse return .auto;
+    return switch (tc) {
+        .string => |c| if (std.mem.eql(u8, c, "none")) .none else if (std.mem.eql(u8, c, "required")) .required else .auto,
+        .object => |o| blk: {
+            const f = o.get("function") orelse break :blk .auto;
+            if (f != .object) break :blk .auto;
+            const n = f.object.get("name") orelse break :blk .auto;
+            break :blk if (n == .string) .{ .function = n.string } else .auto;
+        },
+        else => .auto,
+    };
+}
+
+const Folded = struct { system: []const u8, user: []const u8, image: ?[]const u8 };
+
+/// The messages as the runner's one system and one user turn: system and
+/// developer messages joined; one user turn after them as it is, else the
+/// conversation as a transcript (tool results carry the tool's name). The
+/// last user turn's image. Null (with `err` set) on an image it can't take.
+fn foldMessages(arena: std.mem.Allocator, messages: []const std.json.Value, use_tools: bool, err: *[]const u8) !?Folded {
     var system: std.ArrayList(u8) = .empty;
     var image: ?[]const u8 = null;
     var last_user_index: ?usize = null;
-    var simple = true; // one user turn after the system prompt: no transcript
     var n_turns: usize = 0;
     for (messages, 0..) |m, i| if (roleOf(m)) |r| {
         if (std.mem.eql(u8, r, "user")) last_user_index = i;
         if (!std.mem.eql(u8, r, "system") and !std.mem.eql(u8, r, "developer")) n_turns += 1;
     };
-    simple = n_turns <= 1 and !use_tools;
+    // One user turn after the system prompt: no transcript.
+    const simple = n_turns <= 1 and !use_tools;
 
-    // Conversation turns in order; tool results carry the tool's name.
     var transcript: std.ArrayList(u8) = .empty;
     var last_user: []const u8 = "";
     var call_names: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -364,19 +414,7 @@ fn parseChat(arena: std.mem.Allocator, body: []const u8, err: *[]const u8) !?Cha
             try system.appendSlice(arena, text);
         } else if (std.mem.eql(u8, role, "assistant")) {
             if (text.len > 0) try transcript.print(arena, "Assistant: {s}\n\n", .{text});
-            if (m.object.get("tool_calls")) |tcs| if (tcs == .array) {
-                var calls: std.ArrayList(u8) = .empty;
-                for (tcs.array.items) |tc| {
-                    if (tc != .object) continue;
-                    const f = tc.object.get("function") orelse continue;
-                    if (f != .object) continue;
-                    const name = if (f.object.get("name")) |n| (if (n == .string) n.string else "") else "";
-                    const args: []const u8 = if (f.object.get("arguments")) |a| (if (a == .string) a.string else try std.json.Stringify.valueAlloc(arena, a, .{})) else "{}";
-                    if (tc.object.get("id")) |id| if (id == .string) try call_names.put(arena, id.string, name);
-                    try calls.print(arena, "{s}{{\"name\":{f},\"arguments\":{s}}}", .{ if (calls.items.len > 0) "," else "", std.json.fmt(name, .{}), args });
-                }
-                try transcript.print(arena, "Assistant called tools: [{s}]\n\n", .{calls.items});
-            };
+            if (m.object.get("tool_calls")) |tcs| if (tcs == .array) try foldToolCalls(arena, &transcript, &call_names, tcs.array.items);
         } else if (std.mem.eql(u8, role, "tool")) {
             const id = if (m.object.get("tool_call_id")) |t| (if (t == .string) t.string else "") else "";
             const name = call_names.get(id) orelse (if (m.object.get("name")) |n| (if (n == .string) n.string else "tool") else "tool");
@@ -387,8 +425,28 @@ fn parseChat(arena: std.mem.Allocator, body: []const u8, err: *[]const u8) !?Cha
         }
     }
     const user = if (simple) last_user else try std.fmt.allocPrint(arena, "The conversation so far:\n\n{s}Continue as the assistant.", .{transcript.items});
+    return .{ .system = system.items, .user = user, .image = image };
+}
 
-    var chat: local_llm.Chat = .{ .system = system.items, .user = user, .image = image };
+/// An assistant turn's tool calls into the transcript; their ids' names
+/// into `call_names` (the tool results name the tool).
+fn foldToolCalls(arena: std.mem.Allocator, transcript: *std.ArrayList(u8), call_names: *std.StringHashMapUnmanaged([]const u8), tcs: []const std.json.Value) !void {
+    var calls: std.ArrayList(u8) = .empty;
+    for (tcs) |tc| {
+        if (tc != .object) continue;
+        const f = tc.object.get("function") orelse continue;
+        if (f != .object) continue;
+        const name = if (f.object.get("name")) |n| (if (n == .string) n.string else "") else "";
+        const args: []const u8 = if (f.object.get("arguments")) |a| (if (a == .string) a.string else try std.json.Stringify.valueAlloc(arena, a, .{})) else "{}";
+        if (tc.object.get("id")) |id| if (id == .string) try call_names.put(arena, id.string, name);
+        try calls.print(arena, "{s}{{\"name\":{f},\"arguments\":{s}}}", .{ if (calls.items.len > 0) "," else "", std.json.fmt(name, .{}), args });
+    }
+    try transcript.print(arena, "Assistant called tools: [{s}]\n\n", .{calls.items});
+}
+
+/// The request's generation options: max_tokens, temperature, thinking,
+/// response_format (overridden by tools), keep_alive, context.
+fn applyOptions(arena: std.mem.Allocator, obj: std.json.ObjectMap, chat: *local_llm.Chat) !void {
     if (obj.get("max_tokens") orelse obj.get("max_completion_tokens")) |v| switch (v) {
         .integer => |n| chat.max_tokens = @intCast(std.math.clamp(n, 1, 32768)),
         else => {},
@@ -404,11 +462,7 @@ fn parseChat(arena: std.mem.Allocator, body: []const u8, err: *[]const u8) !?Cha
     if (obj.get("think")) |t| if (t == .bool) {
         chat.think = t.bool; // Ollama's spelling
     };
-    if (use_tools) {
-        chat.schema = try toolSchema(arena, tools, choice);
-        const guide = try toolGuide(arena, tools, choice);
-        chat.system = if (chat.system.len > 0) try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ chat.system, guide }) else guide;
-    } else if (obj.get("response_format")) |rf| if (rf == .object) {
+    if (obj.get("response_format")) |rf| if (rf == .object) {
         const kind = if (rf.object.get("type")) |t| (if (t == .string) t.string else "") else "";
         if (std.mem.eql(u8, kind, "json_schema")) {
             const js = rf.object.get("json_schema") orelse .null;
@@ -420,13 +474,6 @@ fn parseChat(arena: std.mem.Allocator, body: []const u8, err: *[]const u8) !?Cha
     };
     chat.keep_alive_ms = keepAliveMs(obj);
     chat.ctx = requestedCtx(obj);
-    const stream = if (obj.get("stream")) |s| s == .bool and s.bool else false;
-    var include_usage = false;
-    if (obj.get("stream_options")) |so| if (so == .object) if (so.object.get("include_usage")) |iu| {
-        include_usage = iu == .bool and iu.bool;
-    };
-    const requested = if (obj.get("model")) |m| (if (m == .string and m.string.len > 0) m.string else null) else null;
-    return .{ .chat = chat, .model = requested, .stream = stream, .include_usage = include_usage, .tools = use_tools };
 }
 
 const ToolChoice = union(enum) { auto, none, required, function: []const u8 };
@@ -603,32 +650,39 @@ pub fn chatReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server
     const created = std.Io.Clock.real.now(io).toSeconds();
 
     if (req.tools) return toolReply(io, arena, request, req, cfg, model, id, created);
+    if (!req.stream) return try completeChat(io, arena, req, cfg, model, id, created);
+    try streamChat(io, arena, request, req, cfg, model, id, created);
+    return null;
+}
 
-    if (!req.stream) {
-        var diag: []const u8 = "";
-        const res = local_llm.chat(io, gpa, arena, cfg, req.chat, {}, struct {
-            fn f(_: void, _: []const u8) void {}
-        }.f, &diag) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            error.LocalFailed => return errorReply(.internal_server_error, diag, arena),
-        };
-        const counted = usageFields(res);
-        return .{ .body = try std.json.Stringify.valueAlloc(arena, .{
-            .id = id,
-            .object = "chat.completion",
-            .created = created,
-            .model = model,
-            .choices = .{.{
-                .index = 0,
-                .message = .{ .role = "assistant", .content = res.text },
-                .finish_reason = if (res.truncated) "length" else "stop",
-            }},
-            .usage = counted.usage,
-            .timings = counted.timings,
-        }, .{}) };
-    }
+/// The whole answer as one reply.
+fn completeChat(io: std.Io, arena: std.mem.Allocator, req: ChatRequest, cfg: local_llm.Config, model: []const u8, id: []const u8, created: i64) !Reply {
+    var diag: []const u8 = "";
+    const res = local_llm.chat(io, gpa, arena, cfg, req.chat, {}, struct {
+        fn f(_: void, _: []const u8) void {}
+    }.f, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.LocalFailed => return errorReply(.internal_server_error, diag, arena),
+    };
+    const counted = usageFields(res);
+    return .{ .body = try std.json.Stringify.valueAlloc(arena, .{
+        .id = id,
+        .object = "chat.completion",
+        .created = created,
+        .model = model,
+        .choices = .{.{
+            .index = 0,
+            .message = .{ .role = "assistant", .content = res.text },
+            .finish_reason = if (res.truncated) "length" else "stop",
+        }},
+        .usage = counted.usage,
+        .timings = counted.timings,
+    }, .{}) };
+}
 
-    // Server-sent events, one per piece of text as the runner writes it.
+/// Server-sent events, one per piece of text as the runner writes it,
+/// written to `request`.
+fn streamChat(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server.Request, req: ChatRequest, cfg: local_llm.Config, model: []const u8, id: []const u8, created: i64) !void {
     var sse_buf: [16 * 1024]u8 = undefined;
     var bw = try request.respondStreaming(&sse_buf, .{ .respond_options = .{
         .keep_alive = false,
@@ -638,6 +692,7 @@ pub fn chatReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server
         },
     } });
     const Sse = struct {
+        io: std.Io,
         w: *std.http.BodyWriter,
         arena: std.mem.Allocator,
         id: []const u8,
@@ -653,20 +708,21 @@ pub fn chatReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server
                 .model = self.model,
                 .choices = .{.{ .index = 0, .delta = delta, .finish_reason = finish }},
             }, .{}) catch return;
-            self.w.writer.print("data: {s}\n\n", .{json}) catch {
-                self.failed = true;
-                return;
-            };
-            self.w.flush() catch {
-                self.failed = true;
-            };
+            self.w.writer.print("data: {s}\n\n", .{json}) catch return self.fail();
+            self.w.flush() catch return self.fail();
+        }
+        /// The client is gone: stop generating for nobody.
+        fn fail(self: *@This()) void {
+            self.failed = true;
+            local_llm.cancel(self.io);
         }
         fn chunk(self: *@This(), text: []const u8) void {
             self.event(.{ .content = text }, null);
         }
     };
-    var sse: Sse = .{ .w = &bw, .arena = arena, .id = id, .model = model, .created = created };
+    var sse: Sse = .{ .io = io, .w = &bw, .arena = arena, .id = id, .model = model, .created = created };
     sse.event(.{ .role = "assistant", .content = "" }, null);
+    if (sse.failed) return; // gone already: don't generate at all
     var diag: []const u8 = "";
     const res = local_llm.chat(io, gpa, arena, cfg, req.chat, &sse, Sse.chunk, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -675,7 +731,7 @@ pub fn chatReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server
             bw.writer.print("data: {{\"error\":{{\"message\":{f}}}}}\n\n", .{std.json.fmt(diag, .{})}) catch {};
             bw.writer.writeAll("data: [DONE]\n\n") catch {};
             bw.end() catch {};
-            return null;
+            return;
         },
     };
     // The last chunk's delta is an empty object (`.{}` would be `[]`).
@@ -695,7 +751,6 @@ pub fn chatReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.Server
     }
     bw.writer.writeAll("data: [DONE]\n\n") catch {};
     bw.end() catch {};
-    return null;
 }
 
 /// The OpenAI message for a tool-mode answer: `tool_calls` (arguments as
@@ -808,7 +863,7 @@ pub fn writeDiscovery(io: std.Io, env: *const std.process.Environ.Map, url: []co
     const body = std.json.Stringify.valueAlloc(arena, .{
         .version = 1,
         .app = "GhostPen",
-        .pid = if (builtin.os.tag == .windows) @as(i64, std.os.windows.GetCurrentProcessId()) else @as(i64, std.c.getpid()),
+        .pid = currentPid(),
         .url = url,
         .capabilities = .{
             .chat = cfg != null,
@@ -823,10 +878,23 @@ pub fn writeDiscovery(io: std.Io, env: *const std.process.Environ.Map, url: []co
         },
         .updated = std.Io.Clock.real.now(io).toSeconds(),
     }, .{ .whitespace = .indent_2 }) catch return;
-    const dir = std.fs.path.dirname(path) orelse return;
-    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| return log.warn("discovery dir {s}: {s}", .{ dir, @errorName(err) });
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body }) catch |err| return log.warn("discovery file {s}: {s}", .{ path, @errorName(err) });
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| return log.warn("discovery dir {s}: {s}", .{ dir_path, @errorName(err) });
+    // A temporary file renamed over it: a reader never sees half a file. Its
+    // name is this process's, should another app write at the same time.
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err| return log.warn("discovery dir {s}: {s}", .{ dir_path, @errorName(err) });
+    defer dir.close(io);
+    const tmp = std.fmt.allocPrint(arena, "{s}.{d}.tmp", .{ std.fs.path.basename(path), currentPid() }) catch return;
+    dir.writeFile(io, .{ .sub_path = tmp, .data = body }) catch |err| return log.warn("discovery file {s}: {s}", .{ path, @errorName(err) });
+    dir.rename(tmp, dir, std.fs.path.basename(path), io) catch |err| {
+        dir.deleteFile(io, tmp) catch {};
+        return log.warn("discovery file {s}: {s}", .{ path, @errorName(err) });
+    };
     log.info("model service announced in {s}", .{path});
+}
+
+fn currentPid() i64 {
+    return if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
 }
 
 /// Remove the discovery file if it's ours (at exit).
@@ -838,8 +906,7 @@ pub fn removeDiscovery(io: std.Io, env: *const std.process.Environ.Map) void {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch return;
     const Pid = struct { pid: i64 = 0 };
     const parsed = std.json.parseFromSliceLeaky(Pid, arena, data, .{ .ignore_unknown_fields = true }) catch return;
-    const me: i64 = if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
-    if (parsed.pid == me) std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    if (parsed.pid == currentPid()) std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 test "metrics: totals, rates, the last request" {
@@ -886,6 +953,34 @@ test parseDuration {
     try std.testing.expectEqual(@as(?u64, 0), parseDuration("0"));
     try std.testing.expectEqual(@as(?u64, null), parseDuration("-1"));
     try std.testing.expectEqual(@as(?u64, null), parseDuration("soon"));
+    // Out of range or not a number: clamped to a day, or the default.
+    try std.testing.expectEqual(@as(?u64, max_keep_alive_ms), parseDuration("1e300h"));
+    try std.testing.expectEqual(@as(?u64, max_keep_alive_ms), parseDuration("48h"));
+    try std.testing.expectEqual(@as(?u64, null), parseDuration("nan"));
+    try std.testing.expectEqual(@as(?u64, null), parseDuration("infs"));
+    try std.testing.expectEqual(@as(?u64, null), parseDuration("inf"));
+}
+
+test keepAliveMs {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { json: []const u8, want: ?u64 }{
+        .{ .json = "{\"keep_alive\":30}", .want = 30_000 },
+        .{ .json = "{\"keep_alive\":0}", .want = 0 },
+        .{ .json = "{\"keep_alive\":-1}", .want = null },
+        .{ .json = "{\"keep_alive\":9223372036854775807}", .want = max_keep_alive_ms },
+        .{ .json = "{\"keep_alive\":1.5}", .want = 1500 },
+        .{ .json = "{\"keep_alive\":1e300}", .want = max_keep_alive_ms },
+        .{ .json = "{\"keep_alive\":-0.5}", .want = null },
+        .{ .json = "{\"keep_alive\":\"5m\"}", .want = 300_000 },
+        .{ .json = "{\"keep_alive\":true}", .want = null },
+        .{ .json = "{}", .want = null },
+    };
+    for (cases) |case| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.json, .{});
+        try std.testing.expectEqual(case.want, keepAliveMs(v.object));
+    }
 }
 
 test "chat request keeps the selected model" {

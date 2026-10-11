@@ -3,6 +3,7 @@ import { Icon } from "./icons";
 import { cancelAi, clipboardText, copyText, listenVoice, summarizeLink, summaryState, ttsSpeak, ttsStop, ttsWarmUp, type TtsState } from "./api";
 import { listen } from "./events";
 import { renderMarkdown } from "./markdown";
+import { openExternal } from "./oriel";
 
 // What the Zig side reports while it fetches and summarizes
 // (src/main.zig's summarize_link): the stage, the page it found and the
@@ -29,6 +30,16 @@ const STAGE: Record<string, string> = {
 };
 
 const URL_SHAPE = /^https?:\/\/\S+$/i;
+
+// The summary's links open in the browser, never inside this window
+// (markdown.ts only writes http(s) hrefs).
+function openLink(e: { target: EventTarget | null; preventDefault(): void }) {
+  const a = (e.target as Element | null)?.closest?.("a");
+  if (!a) return;
+  e.preventDefault();
+  const href = a.getAttribute("href") ?? "";
+  if (/^https?:\/\//i.test(href)) openExternal(href).catch((err) => console.warn("open link:", err));
+}
 
 // The summary's depth: the id as the protocol sends it (web_page.Level),
 // the label as the picker shows it.
@@ -330,7 +341,7 @@ export default function Summary() {
                   <span>{running ? "Writing…" : "Ready to read"}</span>
                 </div>
                 {state.title && <h2 className="summary-document-title">{state.title}</h2>}
-                <article className="md" dangerouslySetInnerHTML={{ __html: html }} />
+                <article className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: html }} />
               </div>
             ) : running ? null : (
               <div className="summary-empty">

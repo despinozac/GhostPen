@@ -264,7 +264,10 @@ pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8
         .load_ms = load_ms,
     });
 
-    var engine: ?Engine = if (chat) |m| .{ .gpa = gpa, .model = m.model, .ctx = m.ctx, .vocab = c.llama_model_get_vocab(m.model).?, .format = m.format, .template = m.template, .vision = m.vision, .n_ubatch = m.n_ubatch } else null;
+    var engine: ?Engine = if (chat) |m| blk: {
+        const vocab = c.llama_model_get_vocab(m.model).?;
+        break :blk .{ .gpa = gpa, .model = m.model, .ctx = m.ctx, .vocab = vocab, .format = m.format, .template = m.template, .vision = m.vision, .n_ubatch = m.n_ubatch, .specials = controlTexts(gpa, vocab, m.vision != null) };
+    } else null;
 
     // Requests: the worker generates; this thread keeps reading so a cancel
     // gets through.
@@ -434,7 +437,8 @@ const ChatModel = struct {
             // weights into system RAM (the whole blocks stay on the GPU —
             // their attention is cheap); halve the GPU layers only once every
             // expert is already out.
-            if (n_overrides > 0 and ngl >= 999 and n_overrides < blocks) {
+            // (At most `max_moe_blocks` patterns: past that, fewer layers.)
+            if (n_overrides > 0 and ngl >= 999 and n_overrides < @min(blocks, max_moe_blocks)) {
                 const more = @min(n_overrides + @max(blocks / 8, 1), blocks);
                 std.debug.print("ghostpen-llm: not enough GPU memory: {d} of {d} blocks' experts in system RAM\n", .{ more, blocks });
                 n_overrides = writeMoeOverrides(&moe_patterns, &moe_overrides, more);
@@ -449,32 +453,9 @@ const ChatModel = struct {
         if (remembered == null and gpus > 0)
             planRemember(opts, gpus, .{ .ngl = ngl, .experts = n_overrides, .batch = batches.batch, .ubatch = batches.ubatch });
 
-        // The context: as asked, capped at what the model was trained for; on
-        // failure (out of memory) halved down to 2048.
-        const trained: u32 = @intCast(@max(c.llama_model_n_ctx_train(model), 512));
-        var n_ctx = @max(@min(opts.ctx, trained), 512);
-        const ctx = while (true) {
-            var cparams = c.llama_context_default_params();
-            cparams.n_ctx = n_ctx;
-            // The prompt batches (chosen with the plan above): they size the
-            // logits and compute buffers, not the generation speed.
-            cparams.n_batch = batches.batch;
-            cparams.n_ubatch = batches.ubatch;
-            cparams.n_threads = threads;
-            cparams.n_threads_batch = threads;
-            cparams.no_perf = true;
-            cparams.abort_callback = abortCallback;
-            cparams.type_k = opts.kv_type;
-            cparams.type_v = opts.kv_type;
-            cparams.flash_attn_type = opts.flash_attn;
-            if (c.llama_init_from_model(model, cparams)) |ctx| break ctx;
-            if (n_ctx <= 2048) {
-                std.debug.print("ghostpen-llm: could not create a {d}-token context (out of memory?)\n", .{n_ctx});
-                c.llama_model_free(model);
-                return null;
-            }
-            n_ctx = @max(n_ctx / 2, 2048);
-            std.debug.print("ghostpen-llm: retrying with a {d}-token context\n", .{n_ctx});
+        const ctx = createContext(model, opts, batches, threads) orelse {
+            c.llama_model_free(model);
+            return null;
         };
 
         // A resident threadpool (what llama-server does): without one, ggml
@@ -485,28 +466,60 @@ const ChatModel = struct {
         const tp = c.ggml_threadpool_new(&tpp);
         c.llama_attach_threadpool(ctx, tp, tp);
 
-        // The vision projector: on the GPU with the model; without it the
-        // model still answers text.
-        const vision: ?*c.mtmd_context = if (opts.mmproj) |path| blk: {
-            var mp = c.mtmd_context_params_default();
-            mp.use_gpu = ngl > 0;
-            mp.n_threads = threads;
-            mp.print_timings = false;
-            mp.warmup = false;
-            const m = c.mtmd_init_from_file(path.ptr, model, mp) orelse {
-                std.debug.print("ghostpen-llm: could not load the vision projector {s}; images won't be read\n", .{path});
-                break :blk null;
-            };
-            if (!c.mtmd_support_vision(m)) {
-                c.mtmd_free(m);
-                std.debug.print("ghostpen-llm: {s} has no vision encoder; images won't be read\n", .{path});
-                break :blk null;
-            }
-            break :blk m;
-        } else null;
+        const vision: ?*c.mtmd_context = if (opts.mmproj) |path| loadVision(path, model, ngl > 0, threads) else null;
 
         const template: ?[]const u8 = if (c.llama_model_chat_template(model, null)) |t| std.mem.span(t) else null;
         return .{ .model = model, .ctx = ctx, .vision = vision, .ngl = ngl, .n_ubatch = batches.ubatch, .template = template, .format = chat_format.detect(template) };
+    }
+
+    /// The vision projector: on the GPU with the model; without it (null,
+    /// the reason on stderr) the model still answers text.
+    fn loadVision(path: [:0]const u8, model: *c.llama_model, gpu: bool, threads: i32) ?*c.mtmd_context {
+        var mp = c.mtmd_context_params_default();
+        mp.use_gpu = gpu;
+        mp.n_threads = threads;
+        mp.print_timings = false;
+        mp.warmup = false;
+        const m = c.mtmd_init_from_file(path.ptr, model, mp) orelse {
+            std.debug.print("ghostpen-llm: could not load the vision projector {s}; images won't be read\n", .{path});
+            return null;
+        };
+        if (!c.mtmd_support_vision(m)) {
+            c.mtmd_free(m);
+            std.debug.print("ghostpen-llm: {s} has no vision encoder; images won't be read\n", .{path});
+            return null;
+        }
+        return m;
+    }
+
+    /// The context: as asked, capped at what the model was trained for; on
+    /// failure (out of memory) halved down to 2048. Null (the reason on
+    /// stderr) when even that fails.
+    fn createContext(model: *c.llama_model, opts: Options, batches: Batches, threads: i32) ?*c.llama_context {
+        const trained: u32 = @intCast(@max(c.llama_model_n_ctx_train(model), 512));
+        var n_ctx = @max(@min(opts.ctx, trained), 512);
+        while (true) {
+            var cparams = c.llama_context_default_params();
+            cparams.n_ctx = n_ctx;
+            // The prompt batches (chosen with the plan): they size the
+            // logits and compute buffers, not the generation speed.
+            cparams.n_batch = batches.batch;
+            cparams.n_ubatch = batches.ubatch;
+            cparams.n_threads = threads;
+            cparams.n_threads_batch = threads;
+            cparams.no_perf = true;
+            cparams.abort_callback = abortCallback;
+            cparams.type_k = opts.kv_type;
+            cparams.type_v = opts.kv_type;
+            cparams.flash_attn_type = opts.flash_attn;
+            if (c.llama_init_from_model(model, cparams)) |ctx| return ctx;
+            if (n_ctx <= 2048) {
+                std.debug.print("ghostpen-llm: could not create a {d}-token context (out of memory?)\n", .{n_ctx});
+                return null;
+            }
+            n_ctx = @max(n_ctx / 2, 2048);
+            std.debug.print("ghostpen-llm: retrying with a {d}-token context\n", .{n_ctx});
+        }
     }
 
     fn deinit(self: *ChatModel) void {
@@ -580,9 +593,10 @@ const Embedder = struct {
     }
 
     fn embedOne(self: *Embedder, arena: std.mem.Allocator, text: []const u8) ![]const f32 {
-        const n = -c.llama_tokenize(self.vocab, text.ptr, @intCast(text.len), null, 0, true, true);
+        // Plain text: control-token names in it stay text (parse_special off).
+        const n = -c.llama_tokenize(self.vocab, text.ptr, @intCast(text.len), null, 0, true, false);
         var tokens = try arena.alloc(c.llama_token, @intCast(@max(n, 1)));
-        const got = c.llama_tokenize(self.vocab, text.ptr, @intCast(text.len), tokens.ptr, @intCast(tokens.len), true, true);
+        const got = c.llama_tokenize(self.vocab, text.ptr, @intCast(text.len), tokens.ptr, @intCast(tokens.len), true, false);
         if (got <= 0) return error.EmptyText;
         // Longer than the model reads: its start (what search needs most).
         const len = @min(@as(usize, @intCast(got)), self.n_ctx);
@@ -907,16 +921,19 @@ fn moeCpuForVram(opts: Options, blocks: usize, batches: Batches) usize {
     // The experts are ~95% of a MoE model's weights, and the compute
     // buffers need headroom: too thin a margin costs more than a few extra
     // blocks in RAM (each failed load re-reads the whole file).
-    const per_block_mib = 95 * weights_mib / (100 * blocks);
-    const need_mib = weights_mib - budget_mib;
+    // At least 1 MiB: a tiny file over many blocks would divide by zero.
+    const per_block_mib = @max(95 * weights_mib / (100 * blocks), 1);
+    const need_mib = weights_mib -| budget_mib;
     return @min(need_mib / per_block_mib + 1, blocks);
 }
 
 /// The first `n` blocks' expert-tensor patterns as CPU-buffer overrides
-/// (NUL-terminated: llama.cpp reads them as C strings); their count.
+/// (NUL-terminated: llama.cpp reads them as C strings); their count. At
+/// most as many as `patterns` holds: a model with more blocks keeps the
+/// later blocks' experts on the GPU.
 fn writeMoeOverrides(patterns: *[128][96]u8, overrides: *[129]c.llama_model_tensor_buft_override, n: usize) usize {
     var written: usize = 0;
-    for (0..n) |bi| {
+    for (0..@min(n, patterns.len)) |bi| {
         const p = std.fmt.bufPrint(&patterns[written], "blk\\.{d}{s}", .{ bi, ffn_exps_regex }) catch continue;
         patterns[written][p.len] = 0;
         overrides[written] = .{ .pattern = &patterns[written], .buft = c.ggml_backend_cpu_buffer_type() };
@@ -924,6 +941,24 @@ fn writeMoeOverrides(patterns: *[128][96]u8, overrides: *[129]c.llama_model_tens
     }
     overrides[written] = .{ .pattern = null, .buft = null };
     return written;
+}
+
+/// The texts that tokenizing with `parse_special` turns into control
+/// tokens (control and unknown tokens: what parse_special=false leaves as
+/// text), and the image marker with a vision projector; content is
+/// neutralized against them. Empty when out of memory (logged).
+fn controlTexts(gpa: std.mem.Allocator, vocab: *const c.llama_vocab, vision: bool) chat_format.Specials {
+    var texts: std.ArrayList([]const u8) = .empty;
+    const n: usize = @intCast(@max(c.llama_vocab_n_tokens(vocab), 0));
+    for (0..n) |i| {
+        const tok: c.llama_token = @intCast(i);
+        if (c.llama_vocab_get_attr(vocab, tok) & (c.LLAMA_TOKEN_ATTR_CONTROL | c.LLAMA_TOKEN_ATTR_UNKNOWN) == 0) continue;
+        const text = std.mem.span(c.llama_vocab_get_text(vocab, tok) orelse continue);
+        if (text.len == 0) continue;
+        texts.append(gpa, text) catch break;
+    }
+    if (vision) texts.append(gpa, std.mem.span(c.mtmd_default_marker())) catch {};
+    return .init(texts.items);
 }
 
 const Engine = struct {
@@ -941,6 +976,8 @@ const Engine = struct {
     /// prefix, so the next request only evaluates its new tail (what makes an
     /// agent's repeated 100k-token context cheap).
     cached: std.ArrayList(c.llama_token) = .empty,
+    /// Control-token texts: neutralized in the request's content.
+    specials: chat_format.Specials,
 
     fn run(self: *Engine, parsed: std.json.Parsed(Request)) void {
         defer parsed.deinit();
@@ -990,7 +1027,12 @@ const Engine = struct {
         return tokens[0..@intCast(@max(got, 0))];
     }
 
-    fn generate(self: *Engine, arena: std.mem.Allocator, req: Request) Error!void {
+    fn generate(self: *Engine, arena: std.mem.Allocator, request: Request) Error!void {
+        // The prompt is tokenized with parse_special (for the template's
+        // markers): the client's text must not carry any.
+        var req = request;
+        req.system = try chat_format.neutralize(arena, req.system, &self.specials);
+        req.user = try chat_format.neutralize(arena, req.user, &self.specials);
         const n_ctx: usize = c.llama_n_ctx(self.ctx);
         const req_start = std.Io.Clock.awake.now(io);
         var n_prompt: usize = 0;
@@ -1008,40 +1050,11 @@ const Engine = struct {
         const gen_start = std.Io.Clock.awake.now(io);
         const budget = @min(@as(usize, req.max_tokens), n_ctx - n_prompt);
 
-        const chain = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return error.OutOfMemory;
+        const chain = try self.samplerChain(req);
         defer c.llama_sampler_free(chain);
-        if (req.temperature <= 0) {
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_greedy());
-        } else {
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_penalties(c.llama_vocab_n_tokens(self.vocab), 64, 1.05, 0, 0));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_k(40));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_p(0.95, 1));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_min_p(0.05, 1));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_temp(req.temperature));
-            c.llama_sampler_chain_add(chain, c.llama_sampler_init_dist(req.seed));
-        }
-
-        // Schema: the grammar, and a candidate list to sample with it. A
-        // schema the converter can't handle (an agent may send one with
-        // $refs, nullable types, ...) isn't fatal: the answer goes out
-        // unconstrained instead of failing the request.
-        const grammar: ?*c.llama_sampler = if (req.schema.len > 0) blk: {
-            var why: ?[]u8 = null;
-            const gbnf = oriel.llama.jsonSchemaToGrammar(arena, req.schema, &why) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidSchema => {
-                    std.debug.print("ghostpen-llm: unconstrained answer: the JSON schema isn't usable: {s}\n", .{why orelse "invalid"});
-                    break :blk null;
-                },
-                else => |x| return x,
-            };
-            const g = c.llama_sampler_init_grammar(self.vocab, gbnf.ptr, "root") orelse {
-                std.debug.print("ghostpen-llm: unconstrained answer: the schema's grammar couldn't be compiled\n", .{});
-                break :blk null;
-            };
-            break :blk g;
-        } else null;
+        const grammar = try self.grammarSampler(arena, req);
         defer if (grammar) |g| c.llama_sampler_free(g);
+        // A candidate list to sample with the grammar.
         const candidates: []c.llama_token_data = if (grammar != null)
             try arena.alloc(c.llama_token_data, @intCast(c.llama_vocab_n_tokens(self.vocab)))
         else
@@ -1103,6 +1116,43 @@ const Engine = struct {
         return self.finish(req.id, n_prompt, generated, prompt_ms, gen_ms, !cancelled and generated >= budget, cancelled);
     }
 
+    /// Greedy at temperature 0, else llama.cpp's usual chain.
+    fn samplerChain(self: *Engine, req: Request) Error!*c.llama_sampler {
+        const chain = c.llama_sampler_chain_init(c.llama_sampler_chain_default_params()) orelse return error.OutOfMemory;
+        if (req.temperature <= 0) {
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_greedy());
+        } else {
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_penalties(c.llama_vocab_n_tokens(self.vocab), 64, 1.05, 0, 0));
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_k(40));
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_top_p(0.95, 1));
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_min_p(0.05, 1));
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_temp(req.temperature));
+            c.llama_sampler_chain_add(chain, c.llama_sampler_init_dist(req.seed));
+        }
+        return chain;
+    }
+
+    /// The schema's grammar (null: no schema). A schema the converter
+    /// can't handle (an agent may send one with $refs, nullable types, ...)
+    /// isn't fatal: the answer goes out unconstrained instead of failing the
+    /// request.
+    fn grammarSampler(self: *Engine, arena: std.mem.Allocator, req: Request) Error!?*c.llama_sampler {
+        if (req.schema.len == 0) return null;
+        var why: ?[]u8 = null;
+        const gbnf = oriel.llama.jsonSchemaToGrammar(arena, req.schema, &why) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidSchema => {
+                std.debug.print("ghostpen-llm: unconstrained answer: the JSON schema isn't usable: {s}\n", .{why orelse "invalid"});
+                return null;
+            },
+            else => |x| return x,
+        };
+        return c.llama_sampler_init_grammar(self.vocab, gbnf.ptr, "root") orelse {
+            std.debug.print("ghostpen-llm: unconstrained answer: the schema's grammar couldn't be compiled\n", .{});
+            return null;
+        };
+    }
+
     /// The next token under `grammar`: drawn from the usual chain and only
     /// checked against the grammar; only when it's rejected does the grammar
     /// filter the whole vocabulary before drawing again. Both samplers
@@ -1160,6 +1210,9 @@ const Engine = struct {
             c.llama_memory_clear(mem, true);
             common = 0;
         }
+        // The cache holds only the prefix now: a prefill cancelled or failed
+        // below must not leave the next request trusting the old tail.
+        self.cached.shrinkRetainingCapacity(common);
         var pos: usize = common;
         while (pos < tokens.len) {
             const n = @min(tokens.len - pos, self.n_ubatch);

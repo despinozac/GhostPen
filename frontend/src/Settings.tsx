@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Settings as SettingsType,
   Profile,
@@ -71,8 +71,38 @@ function DeviceOptions({ devices, selected }: { devices: AudioDevice[]; selected
   );
 }
 
+type Fields = Record<string, unknown>;
+const isObject = (v: unknown): v is Fields => typeof v === "object" && v !== null && !Array.isArray(v);
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/** `fresh` (the settings saved now) with only what the form changed since
+ *  `base` (what it loaded): edits made elsewhere meanwhile (the overlays'
+ *  toggles, another window) survive. One level into objects, lists whole. */
+function mergeChanges(fresh: SettingsType, base: SettingsType, form: SettingsType): SettingsType {
+  const out: Fields = { ...(fresh as unknown as Fields) };
+  const f = form as unknown as Fields;
+  const b = base as unknown as Fields;
+  for (const k of Object.keys(f)) {
+    const fv = f[k];
+    const bv = b[k];
+    if (same(fv, bv)) continue;
+    const cur = out[k];
+    if (isObject(fv) && isObject(bv) && isObject(cur)) {
+      const sub: Fields = { ...cur };
+      for (const sk of Object.keys(fv)) if (!same(fv[sk], bv[sk])) sub[sk] = fv[sk];
+      out[k] = sub;
+    } else out[k] = fv;
+  }
+  return out as unknown as SettingsType;
+}
+
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 export default function Settings() {
   const [settings, setSettings] = useState<SettingsType | null>(null);
+  // The settings as last loaded or saved: what a save diffs the form against.
+  const [base, setBase] = useState<SettingsType | null>(null);
+  const [loadError, setLoadError] = useState("");
   const [status, setStatus] = useState<Status | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [modelMsg, setModelMsg] = useState<string>("");
@@ -85,12 +115,25 @@ export default function Settings() {
   const [capDevices, setCapDevices] = useState<AudioDevice[]>([]);
   const [dictDevices, setDictDevices] = useState<AudioDevice[]>([]);
   const [llm, setLlm] = useState<LlmStatus | null>(null);
+  // For the focus handler: an untouched form follows changes made elsewhere.
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+
+  const loadSettings = () =>
+    getSettings()
+      .then((s) => {
+        setSettings(s);
+        setBase(s);
+        setLoadError("");
+      })
+      .catch((e) => setLoadError(errorText(e)));
 
   useEffect(() => {
-    getSettings().then(setSettings);
-    // The window is only hidden on close: re-read the live state (not the
-    // settings being edited) each time it is shown again.
+    loadSettings();
+    // The window is only hidden on close: re-read the live state each time
+    // it is shown again, and the settings too while the form is unedited.
     const refresh = () => {
+      if (!dirtyRef.current) loadSettings();
       getStatus().then(setStatus).catch(() => {});
       captionsStatus().then(setCapStatus).catch(() => {});
       captionsListDevices().then(setCapDevices).catch(() => {});
@@ -102,7 +145,15 @@ export default function Settings() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
-  if (!settings) return <div className="settings loading-page">Loading…</div>;
+  if (!settings)
+    return loadError ? (
+      <div className="settings loading-page" role="alert">
+        <p>Could not load the settings: {loadError}</p>
+        <button className="btn" type="button" onClick={() => { setLoadError(""); loadSettings(); }}>Try again</button>
+      </div>
+    ) : (
+      <div className="settings loading-page">Loading…</div>
+    );
 
   const active =
     settings.profiles.find((p) => p.id === settings.activeProfileId) ?? settings.profiles[0];
@@ -251,13 +302,19 @@ export default function Settings() {
     if (!dirty || saving) return;
     setSaving(true);
     try {
-      await saveSettings(settings);
+      // On top of the settings saved now, only the fields edited here: a
+      // form opened earlier doesn't undo what changed elsewhere since.
+      const fresh = await getSettings();
+      const next = base ? mergeChanges(fresh, base, settings) : settings;
+      await saveSettings(next);
+      setBase(next);
+      setSettings(next);
       setDirty(false);
       setSaved(true);
       setSaveError("");
     } catch (e) {
       setSaved(false);
-      setSaveError(e instanceof Error ? e.message : String(e));
+      setSaveError(errorText(e));
     } finally {
       setSaving(false);
     }
@@ -267,7 +324,9 @@ export default function Settings() {
   const closeSettings = async () => {
     if (dirty) {
       try {
-        setSettings(await getSettings());
+        const s = await getSettings();
+        setSettings(s);
+        setBase(s);
         setDirty(false);
         setSaved(false);
         setSaveError("");

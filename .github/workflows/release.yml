@@ -197,7 +197,7 @@ jobs:
           Add-Content $env:GITHUB_PATH $bin
           $env:Path = "$bin;$env:Path"
           oriel setup nsis --yes
-          oriel setup webview2 --yes
+          oriel webview2
       # Whisper and the local model on the GPU through Vulkan (any vendor),
       # compiled into ghostpen.exe; without a Vulkan driver it runs on the CPU.
       # Only glslc and the headers are used, at build time.
@@ -362,8 +362,8 @@ jobs:
             zig build sign-update -- "dist/$1" --app-id dev.ghostpen.Oriel --version "$V" \
               --target "$2" --url "$BASE/$1" --key "$KEY_FILE" --format "$3" --out "dist/update-$2.json"
           }
-          sign "ghostpen-$V-x86_64.AppImage" x86_64-linux raw
-          sign "ghostpen-$V-x86_64-cuda.AppImage" x86_64-linux-cuda raw
+          sign "ghostpen-$V-x86_64.AppImage" x86_64-linux appimage
+          sign "ghostpen-$V-x86_64-cuda.AppImage" x86_64-linux-cuda appimage
           sign ghostpen-x86_64-windows.exe x86_64-windows raw
           sign GhostPen-aarch64-macos.app.tar.gz aarch64-macos app.tar.gz
           zig build combine-manifests -- dist/update-*.json \

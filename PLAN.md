@@ -14,7 +14,7 @@ Feature parity target: everything in the Tauri app, same settings schema
 | GhostPen (Tauri) | GhostPen on Oriel |
 | --- | --- |
 | Rust commands (`lib.rs`) | `Commands` in `src/main.zig` (same names, same JSON shapes) |
-| Events `ghostpen://…` | `Events` (same names) via `App.emit` / `Window.emit` |
+| Events `ghostpen://…` | `Events` (same names) via `App.events(Events).emit` / `.emitTo` |
 | 5 static windows (menu, settings, playground, captions, dictation) | `App.openWindow` at setup, hidden; hash routes unchanged |
 | tauri-plugin-store `settings.json` | `src/settings.zig`: JSON file in the app data dir, schema + defaults |
 | reqwest AI client, SSE, vision | `src/ai.zig` on `std.http.Client` (timeouts, SSE, image_url) |

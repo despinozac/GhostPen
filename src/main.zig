@@ -153,7 +153,8 @@ pub const Events = struct {
     @"ghostpen://captions-show": struct {},
     @"ghostpen://caption": struct { text: []const u8, translated: bool },
     @"ghostpen://caption-error": []const u8,
-    @"ghostpen://dictation": struct { text: []const u8, state: []const u8 },
+    /// `message`: an error that kept the dictated text ("" otherwise).
+    @"ghostpen://dictation": struct { text: []const u8, state: []const u8, message: []const u8 = "" },
     @"ghostpen://dictation-level": f32,
     @"ghostpen://dictation-show": struct {},
     /// What a menu action is doing (to the menu): loading the built-in
@@ -170,11 +171,18 @@ pub const Events = struct {
     @"tts:state": @FieldType(oriel.tts.Events, "tts:state"),
     /// Update download progress (Settings).
     @"ghostpen://update-progress": updates.Progress,
+    /// The summarize-link flow's state (to the Summary window); the
+    /// accumulating markdown travels in summary-chunk.
+    @"ghostpen://summary-status": struct { state: []const u8, title: []const u8, chars: usize, message: []const u8 },
+    @"ghostpen://summary-chunk": []const u8,
 };
+
+/// The typed emitter for `Events` (any thread).
+pub const events = App.events(Events);
 
 /// GhostPen's own "tts:state" (before oriel.tts speaks): to every window.
 fn ttsStateChanged(s: tts.State) void {
-    App.emit("tts:state", s);
+    events.emit(.@"tts:state", s);
 }
 
 // ---- built-in models (GhostPen runs them) -------------------------------------------------------
@@ -184,7 +192,7 @@ var environ_map: *const std.process.Environ.Map = undefined;
 var self_exe: ?[]const u8 = null;
 
 pub fn llmDirs(arena: std.mem.Allocator) !llm_models.Dirs {
-    const base = try oriel.store.dataDir(arena, "GhostPen");
+    const base = try oriel.paths.appData(arena, .{ .name = "GhostPen" });
     return llm_models.dirs(arena, try std.fs.path.join(arena, &.{ base, "models" }), environ_map);
 }
 
@@ -299,7 +307,7 @@ fn summarySet(state: []const u8, title: []const u8, chars: usize, message: []con
     defer summary_mutex.unlock(io);
     summaryStoreLocked(state, title, chars, message);
     // The live update: the accumulating markdown travels separately.
-    App.emitTo("summary", "ghostpen://summary-status", .{
+    events.emitTo("summary", .@"ghostpen://summary-status", .{
         .state = link_summary.state,
         .title = link_summary.title,
         .chars = link_summary.chars,
@@ -342,7 +350,7 @@ fn completeWithProgress(arena: std.mem.Allocator, req: ai.Request) ![]const u8 {
     const local = req.profile.isLocal();
     const model = if (local) localModelName(req.profile.model) else req.profile.name;
     const first: []const u8 = if (!local) "waiting" else if (local_llm.loaded()) "reading" else "loading";
-    App.emitTo("main", "ghostpen://ai-progress", AiProgress{ .stage = first, .model = model }) catch {};
+    events.emitTo("main", .@"ghostpen://ai-progress", AiProgress{ .stage = first, .model = model }) catch {};
     if (!local) return complete(arena, req);
 
     const Counter = struct {
@@ -361,7 +369,7 @@ fn completeWithProgress(arena: std.mem.Allocator, req: ai.Request) ![]const u8 {
             c.last_ms = ms;
             const writing_ms = c.first_token.?.durationTo(now).toMilliseconds();
             const tok_s: f32 = if (writing_ms > 0) @as(f32, @floatFromInt(c.tokens)) * 1000 / @as(f32, @floatFromInt(writing_ms)) else 0;
-            App.emitTo("main", "ghostpen://ai-progress", AiProgress{ .stage = "writing", .model = c.model, .tokens = c.tokens, .tok_s = tok_s }) catch {};
+            events.emitTo("main", .@"ghostpen://ai-progress", AiProgress{ .stage = "writing", .model = c.model, .tokens = c.tokens, .tok_s = tok_s }) catch {};
         }
     };
     var counter: Counter = .{ .model = model, .start = std.Io.Clock.awake.now(io) };
@@ -533,7 +541,7 @@ fn triggerWorker() void {
     App.runOnMain({}, struct {
         fn show(_: void) void {
             showWindow("main", true);
-            App.emitTo("main", "ghostpen://show", .{}) catch {};
+            events.emitTo("main", .@"ghostpen://show", .{}) catch {};
         }
     }.show);
 }
@@ -813,16 +821,16 @@ pub const Commands = struct {
         const r = try resolveAction(arena, s, args.action, args.targetLang, parseLevel(args.level));
         const Emit = struct {
             fn chunk(_: void, delta: []const u8) void {
-                App.emitTo("playground", "ghostpen://chunk", delta) catch {};
+                events.emitTo("playground", .@"ghostpen://chunk", delta) catch {};
             }
         };
         var diag: ai.Diag = .{};
         const final = ai.completeStream(io, gpa, arena, .{ .profile = r.profile, .system = r.system, .user = .{ .text = args.text } }, {}, Emit.chunk, &diag) catch |err| {
             const msg = if (err == error.AiFailed) diag.message else @errorName(err);
-            App.emitTo("playground", "ghostpen://error", msg) catch {};
+            events.emitTo("playground", .@"ghostpen://error", msg) catch {};
             return;
         };
-        App.emitTo("playground", "ghostpen://done", final) catch {};
+        events.emitTo("playground", .@"ghostpen://done", final) catch {};
     }
 
     // ---- Summarize a link ----
@@ -891,7 +899,7 @@ pub const Commands = struct {
                 summary_markdown.appendSlice(gpa, delta) catch |err| log.warn("summary: a chunk was not kept ({s})", .{@errorName(err)});
                 link_summary.markdown = summary_markdown.items;
                 summary_mutex.unlock(io);
-                App.emitTo("summary", "ghostpen://summary-chunk", delta) catch {};
+                events.emitTo("summary", .@"ghostpen://summary-chunk", delta) catch {};
             }
         };
         summarySet("writing", pd.title, pd.text.len, "");
@@ -940,7 +948,7 @@ pub const Commands = struct {
         const d = try llmDirs(arena);
         const Emit = struct {
             fn progress(_: void, p: llm_models.Progress) void {
-                App.emitTo("settings", "ghostpen://llm-download", p) catch {};
+                events.emitTo("settings", .@"ghostpen://llm-download", p) catch {};
             }
         };
         var status: std.http.Status = .ok;
@@ -1148,19 +1156,32 @@ fn handleArgs(args: []const []const u8) void {
 
 var launch_args: []const []const u8 = &.{};
 
-/// Oriel currently maps focus_on_show to exclusive layer-shell focus. The main
-/// window has no config override, so opt it into on-demand focus before showing
-/// it: clicking another app must release the keyboard while the menu stays open.
+/// The main window's GtkWindow (Linux), from Oriel's window_created hook.
+var main_gtk_window: ?*anyopaque = null;
+
+fn windowCreated(w: oriel.hooks.Window) void {
+    if (!std.mem.eql(u8, w.label, "main")) return;
+    switch (w.native) {
+        .gtk => |g| main_gtk_window = g,
+        else => {},
+    }
+}
+
+/// Oriel maps focus_on_show to exclusive layer-shell focus, and
+/// focus_on_show = false would stop the menu taking the keyboard on Windows
+/// and macOS. So opt the main window into on-demand focus here, after Oriel
+/// made it a layer surface: clicking another app must release the keyboard
+/// while the menu stays open.
 fn configureMenuFocus() void {
     if (comptime builtin.os.tag != .linux) return;
-    const w = App.getWindow("main") orelse return;
+    const gtk_window = main_gtk_window orelse return;
     var lib = std.DynLib.open("libgtk4-layer-shell.so.0") catch return;
     defer lib.close();
     const LayerWindow = *const fn (*anyopaque) callconv(.c) c_int;
     const SetKeyboardMode = *const fn (*anyopaque, c_int) callconv(.c) void;
     const is_layer = lib.lookup(LayerWindow, "gtk_layer_is_layer_window") orelse return;
     const set_mode = lib.lookup(SetKeyboardMode, "gtk_layer_set_keyboard_mode") orelse return;
-    if (is_layer(w.handle.gtk_window) != 0) set_mode(w.handle.gtk_window, 2); // ON_DEMAND
+    if (is_layer(gtk_window) != 0) set_mode(gtk_window, 2); // ON_DEMAND
 }
 
 fn setup() !void {
@@ -1186,7 +1207,7 @@ fn setup() !void {
         .id = settings_mod.app_id,
         .title = "GhostPen",
         .tooltip = "GhostPen",
-        .icon = .{ .png = app.icon_bytes },
+        .icon = .{ .png = app.build.icon.? },
         .menu = &.{
             .{ .item = .{ .id = "show", .label = "Show menu" } },
             .{ .item = .{ .id = "dictate", .label = "Dictation" } },
@@ -1231,7 +1252,7 @@ fn probeInput() void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     defer input_probed.store(true, .release);
-    const check = oriel.input.check(arena.allocator(), .{ .io = io, .icon_png = app.icon_bytes }) catch return;
+    const check = oriel.input.check(arena.allocator(), .{ .io = io, .icon_png = app.build.icon.? }) catch return;
     input_available.store(check.ok, .release);
     if (!check.ok) log.info("synthetic input unavailable ({s}): manual-copy mode", .{check.detail});
 }
@@ -1326,34 +1347,36 @@ pub fn main(init: std.process.Init) !u8 {
     // The model service's discovery file goes with the app (a stale one is
     // also ignored: its pid is gone).
     defer @import("model_server.zig").removeDiscovery(io, environ_map);
+    // The main window's GtkWindow, for configureMenuFocus (subscribed before
+    // oriel.main so the main window's creation is seen).
+    if (comptime builtin.os.tag == .linux) try oriel.hooks.subscribe(.{ .window_created = windowCreated });
+    // Logoff, shutdown or quit: the process can be killed before `oriel.main`
+    // returns, so the deferred cleanup above runs on `terminating` too.
+    try oriel.lifecycle.subscribe(onLifecycle);
     return oriel.main(init, .{ .commands = Commands, .events = Events }, .{
-        .id = settings_mod.app_id,
-        .title = "GhostPen",
-        // The menu: a frameless floating panel, shown by the trigger.
-        .width = 420,
-        .height = 640,
-        .resizable = false,
-        .decorations = false,
-        .always_on_top = true,
-        .skip_taskbar = true,
-        .placement = .{},
-        // The page paints only its rounded panel (.menu): the corners show
-        // what's behind the window.
-        .transparent = true,
-        .show_main_window = false,
-        .on_close = .hide,
-        .assets = app.assets,
-        .dev = app.dev,
-        .icon = app.icon_bytes,
-        .permissions = app.permissions,
+        .app = app.build,
+        .window = .{
+            .title = "GhostPen",
+            // The menu: a frameless floating panel, shown by the trigger.
+            .width = 420,
+            .height = 640,
+            .resizable = false,
+            .decorations = false,
+            .always_on_top = true,
+            .skip_taskbar = true,
+            .placement = .{},
+            // The page paints only its rounded panel (.menu): the corners show
+            // what's behind the window.
+            .transparent = true,
+            .visible = false,
+            .hide_on_close = true,
+        },
         .setup = &setup,
         .on_second_instance = &handleArgs,
-        .on_session_end = &sessionEnd,
     });
 }
 
-/// Windows logoff or shutdown: the process can be killed before `oriel.main`
-/// returns, so the deferred cleanup above runs here too.
-fn sessionEnd() void {
-    @import("model_server.zig").removeDiscovery(io, environ_map);
+fn onLifecycle(event: oriel.lifecycle.Event) void {
+    if (event == .terminating) @import("model_server.zig").removeDiscovery(io, environ_map);
 }
+

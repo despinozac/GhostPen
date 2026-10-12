@@ -15,6 +15,7 @@ const models = @import("models.zig");
 const captions = @import("captions.zig");
 
 const App = oriel.App;
+const events = main.events;
 const audio = oriel.audio_capture;
 const log = std.log.scoped(.dictation);
 const gpa = std.heap.smp_allocator;
@@ -73,13 +74,13 @@ fn language(buf: []u8) []const u8 {
 }
 
 fn update(text: []const u8, state: []const u8) void {
-    App.emit("ghostpen://dictation", .{ .text = text, .state = state });
+    events.emit(.@"ghostpen://dictation", .{ .text = text, .state = state });
 }
 
 /// An error that keeps the dictated text: the pill shows `message` and
 /// offers `text` to copy.
 fn updateKeep(text: []const u8, message: []const u8) void {
-    App.emit("ghostpen://dictation", .{ .text = text, .state = "error", .message = message });
+    events.emit(.@"ghostpen://dictation", .{ .text = text, .state = "error", .message = message });
 }
 
 const Session = struct {
@@ -195,7 +196,7 @@ const Session = struct {
             const tail = items[items.len -| (rate / 10)..];
             const lvl = models.level(tail);
             s.buf_mutex.unlock(main.io);
-            App.emit("ghostpen://dictation-level", lvl);
+            events.emit(.@"ghostpen://dictation-level", lvl);
         }
     }
 
@@ -402,7 +403,7 @@ fn showOverlay() void {
     const w = App.ensureWindow("dictation") catch |err| return log.err("dictation window: {s}", .{@errorName(err)});
     w.show();
     w.focus();
-    App.emit("ghostpen://dictation-show", .{});
+    events.emit(.@"ghostpen://dictation-show", .{});
 }
 
 /// The `--voice-input` hotkey / tray item: finish when listening, else show

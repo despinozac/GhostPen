@@ -10,6 +10,7 @@ const models = @import("models.zig");
 const stt_server = @import("stt_server.zig");
 
 const App = oriel.App;
+const events = main.events;
 const audio = oriel.audio_capture;
 const log = std.log.scoped(.captions);
 const gpa = std.heap.smp_allocator;
@@ -43,7 +44,7 @@ fn warmUpMetal() void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const version = @import("ghostpen_build").version;
-    const base = oriel.store.dataDir(arena, "GhostPen") catch return;
+    const base = oriel.paths.appData(arena, .{ .name = "GhostPen" }) catch return;
     const marker = std.fs.path.join(arena, &.{ base, "whisper-warm-version" }) catch return;
     const cwd = std.Io.Dir.cwd();
     if (cwd.readFileAlloc(main.io, marker, arena, .limited(64))) |seen| {
@@ -186,11 +187,11 @@ const Session = struct {
 
             if (translate_live.load(.acquire)) {
                 if (main.translateText(arena.allocator(), text, s.target_lang)) |t| {
-                    App.emit("ghostpen://caption", .{ .text = t, .translated = true });
+                    events.emit(.@"ghostpen://caption", .{ .text = t, .translated = true });
                     continue;
                 } else |err| log.warn("translation failed ({s}); showing the original", .{@errorName(err)});
             }
-            App.emit("ghostpen://caption", .{ .text = text, .translated = false });
+            events.emit(.@"ghostpen://caption", .{ .text = text, .translated = false });
         }
     }
 
@@ -208,7 +209,7 @@ fn emitError(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
     log.warn("{s}", .{msg});
-    App.emit("ghostpen://caption-error", msg);
+    events.emit(.@"ghostpen://caption-error", msg);
 }
 
 /// The source to capture: the configured one (a case-insensitive substring of
@@ -309,7 +310,7 @@ pub fn open() void {
     w.setClickThrough(false);
     w.show();
     w.focus();
-    App.emit("ghostpen://captions-show", .{});
+    events.emit(.@"ghostpen://captions-show", .{});
 }
 
 /// The `--captions` hotkey: stop and hide when running, else show and start.
@@ -340,10 +341,10 @@ fn startFromToggle() void {
     _ = start(arena.allocator()) catch |err| {
         if (err == error.Cancelled) return;
         const msg = if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err);
-        App.emit("ghostpen://caption-error", msg);
+        events.emit(.@"ghostpen://caption-error", msg);
         return;
     };
-    App.emit("ghostpen://captions-show", .{});
+    events.emit(.@"ghostpen://captions-show", .{});
 }
 
 const Status = struct {
@@ -451,7 +452,7 @@ pub const Commands = struct {
     pub fn whisper_download_model(arena: std.mem.Allocator, args: struct { id: []const u8 }) !void {
         const Emit = struct {
             fn progress(_: void, p: models.Progress) void {
-                App.emitTo("settings", "ghostpen://whisper-download", p) catch {};
+                events.emitTo("settings", .@"ghostpen://whisper-download", p) catch {};
             }
         };
         var status: std.http.Status = .ok;

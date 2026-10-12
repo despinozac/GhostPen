@@ -77,9 +77,6 @@ pub fn init(env: *const std.process.Environ.Map) void {
             manifest_url = owned;
         } else |_| {}
     }
-    // $APPIMAGE / $APPDIR (for replacing an AppImage), and removes a
-    // replaced Windows exe left from the last update.
-    updater.init(main.io, gpa, env) catch |err| log.warn("updater: {s}", .{@errorName(err)});
     const t = std.Thread.spawn(.{}, autoLoop, .{}) catch |err| {
         log.warn("automatic updates are off: no thread ({s})", .{@errorName(err)});
         return;
@@ -212,10 +209,10 @@ fn install() ![]u8 {
 
     const Progress_ = struct {
         fn cb(_: ?*anyopaque, downloaded: u64, total: ?u64) void {
-            oriel.App.emit("ghostpen://update-progress", Progress{ .downloaded = downloaded, .total = total });
+            main.events.emit(.@"ghostpen://update-progress", Progress{ .downloaded = downloaded, .total = total });
         }
     };
-    const dest = updater.download(main.io, gpa, u, null, .{ .callback = Progress_.cb }) catch |err| {
+    const dest = updater.download(main.io, gpa, u, .{ .progress = .{ .callback = Progress_.cb } }) catch |err| {
         mutex.lockUncancelable(main.io);
         defer mutex.unlock(main.io);
         if (pending == null) {

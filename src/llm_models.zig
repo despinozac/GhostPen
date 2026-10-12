@@ -111,7 +111,7 @@ pub fn dirs(arena: std.mem.Allocator, own: []const u8, env: *const std.process.E
 }
 
 /// `<data dir>/GhostPen/models` without Oriel (for the CLI): the place
-/// `oriel.store.dataDir` gives the app.
+/// `oriel.paths.appData` gives the app.
 pub fn ownDir(arena: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
     const base = platformDataDir(arena, env) orelse return null;
     return std.fs.path.join(arena, &.{ base, "GhostPen", "models" }) catch null;

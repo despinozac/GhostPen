@@ -106,7 +106,7 @@ fn readStore(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator) Loade
 }
 
 fn settingsFileExists(io: std.Io, gpa: std.mem.Allocator) bool {
-    const dir = oriel.store.configDir(gpa, app_id) catch return false;
+    const dir = oriel.paths.appConfig(gpa, .{ .name = app_id }) catch return false;
     defer gpa.free(dir);
     const path = std.fs.path.join(gpa, &.{ dir, "settings.json" }) catch return false;
     defer gpa.free(path);
@@ -116,8 +116,8 @@ fn settingsFileExists(io: std.Io, gpa: std.mem.Allocator) bool {
 
 fn importTauri(arena: std.mem.Allocator, gpa: std.mem.Allocator) ?Settings {
     // Next to our own data folder (which exists): only read, never create
-    // the other app's folder (oriel.store.dataDir would).
-    const own = oriel.store.dataDir(gpa, "GhostPen") catch return null;
+    // the other app's folder (oriel.paths.appData would).
+    const own = oriel.paths.appData(gpa, .{ .name = "GhostPen" }) catch return null;
     defer gpa.free(own);
     const base = std.fs.path.dirname(own) orelse return null;
     const tauri_path = std.fs.path.join(gpa, &.{ base, tauri_app_id, "settings.json" }) catch return null;

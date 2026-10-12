@@ -70,7 +70,7 @@ pub fn validId(id: []const u8) bool {
 
 /// `<data dir>/GhostPen/models` (created). Caller frees.
 pub fn dir(gpa: std.mem.Allocator) ![]u8 {
-    const base = try oriel.store.dataDir(gpa, "GhostPen");
+    const base = try oriel.paths.appData(gpa, .{ .name = "GhostPen" });
     defer gpa.free(base);
     return std.fs.path.join(gpa, &.{ base, "models" });
 }

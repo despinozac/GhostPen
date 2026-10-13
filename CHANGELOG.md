@@ -4,6 +4,21 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-10-13
+
+### Changed
+
+- Built on Oriel 0.12.1, which keeps one API per feature (GhostPen's events,
+  window setup and paths moved to it).
+- Linux/Wayland: the menu's keyboard focus comes from Oriel. The menu takes
+  the keyboard when it opens and lets go when you click another app, without
+  GhostPen setting the layer-shell mode itself.
+
+### Fixed
+
+- Linux/Wayland: the dictation pill and live captions no longer take the
+  keyboard when they appear (on Hyprland they did, and typing went to them).
+
 ## [0.2.23] - 2026-10-11
 
 ### Changed

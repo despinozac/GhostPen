@@ -1156,36 +1156,7 @@ fn handleArgs(args: []const []const u8) void {
 
 var launch_args: []const []const u8 = &.{};
 
-/// The main window's GtkWindow (Linux), from Oriel's window_created hook.
-var main_gtk_window: ?*anyopaque = null;
-
-fn windowCreated(w: oriel.hooks.Window) void {
-    if (!std.mem.eql(u8, w.label, "main")) return;
-    switch (w.native) {
-        .gtk => |g| main_gtk_window = g,
-        else => {},
-    }
-}
-
-/// Oriel maps focus_on_show to exclusive layer-shell focus, and
-/// focus_on_show = false would stop the menu taking the keyboard on Windows
-/// and macOS. So opt the main window into on-demand focus here, after Oriel
-/// made it a layer surface: clicking another app must release the keyboard
-/// while the menu stays open.
-fn configureMenuFocus() void {
-    if (comptime builtin.os.tag != .linux) return;
-    const gtk_window = main_gtk_window orelse return;
-    var lib = std.DynLib.open("libgtk4-layer-shell.so.0") catch return;
-    defer lib.close();
-    const LayerWindow = *const fn (*anyopaque) callconv(.c) c_int;
-    const SetKeyboardMode = *const fn (*anyopaque, c_int) callconv(.c) void;
-    const is_layer = lib.lookup(LayerWindow, "gtk_layer_is_layer_window") orelse return;
-    const set_mode = lib.lookup(SetKeyboardMode, "gtk_layer_set_keyboard_mode") orelse return;
-    if (is_layer(gtk_window) != 0) set_mode(gtk_window, 2); // ON_DEMAND
-}
-
 fn setup() !void {
-    configureMenuFocus();
     shared.load(io, gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -1347,9 +1318,6 @@ pub fn main(init: std.process.Init) !u8 {
     // The model service's discovery file goes with the app (a stale one is
     // also ignored: its pid is gone).
     defer @import("model_server.zig").removeDiscovery(io, environ_map);
-    // The main window's GtkWindow, for configureMenuFocus (subscribed before
-    // oriel.main so the main window's creation is seen).
-    if (comptime builtin.os.tag == .linux) try oriel.hooks.subscribe(.{ .window_created = windowCreated });
     // Logoff, shutdown or quit: the process can be killed before `oriel.main`
     // returns, so the deferred cleanup above runs on `terminating` too.
     try oriel.lifecycle.subscribe(onLifecycle);

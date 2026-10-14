@@ -4,6 +4,8 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-10-14
+
 ### Fixed
 
 - Live captions on "Auto" follow the system's *current* output, so they keep

@@ -4,6 +4,18 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- Live captions on "Auto" follow the system's *current* output, so they keep
+  working the moment a Bluetooth headset pairs and the machine starts playing
+  through it. On Linux the capture opens the monitor of the default sink
+  (`pactl get-default-sink`, as the Rust GhostPen resolved it); on Windows the
+  default output's WASAPI loopback. The first-monitor pick before it stayed on
+  whatever monitor was listed first — often a silent virtual loopback — while
+  the audio moved to another sink. An explicit Capture device picks a monitor
+  of the same device you chose, so "OpenFit 2+ by Shokz" doesn't grab the
+  headset's microphone before its playback monitor when you pick it by name.
+
 ## [0.2.24] - 2026-10-13
 
 ### Changed

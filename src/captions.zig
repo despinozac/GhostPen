@@ -212,22 +212,65 @@ fn emitError(comptime fmt: []const u8, args: anytype) void {
     events.emit(.@"ghostpen://caption-error", msg);
 }
 
-/// The source to capture: the configured one (a case-insensitive substring of
-/// its name or description), else the first system-audio (monitor) source.
-/// Caller frees.
+/// The source to capture: on "Auto" the system's *current* output — whatever
+/// it plays through (a Bluetooth headset pairing, a monitor going to sleep):
+/// the first-monitor pick before it sat on whatever monitor happened to be
+/// first on the sound server (here, a virtual loopback), so when audio moved
+/// to another sink, captions captured silence ("Listening…" and nothing else).
+/// Otherwise a case-insensitive substring of the configured name or
+/// description. Caller frees.
 fn pickSource(device: []const u8) ![:0]u8 {
     const sources = try audio.listSources(gpa);
     defer audio.freeSources(gpa, sources);
     const want = std.mem.trim(u8, device, " \t");
     const auto = want.len == 0 or std.ascii.eqlIgnoreCase(want, "auto") or std.ascii.eqlIgnoreCase(want, "default");
-    for (sources) |src| {
-        if (auto) {
+    if (auto) {
+        switch (builtin.os.tag) {
+            // The sound server resolves these to its *current* default output
+            // (Linux: PulseWire's pulse server and PulseAudio ≥ 15; Windows:
+            // the default render endpoint in loopback mode). The stream keeps
+            // the source it opened, so switching outputs needs a new session.
+            .linux => if (try defaultSinkMonitor(sources)) |name| return name,
+            .windows => return gpa.dupeZ(u8, "loopback"),
+            else => {}, // macOS (the audio tap, BlackHole): the first monitor source
+        }
+        for (sources) |src| {
             if (src.monitor) return gpa.dupeZ(u8, src.name);
-        } else if (containsIgnoreCase(src.name, want) or containsIgnoreCase(src.description, want)) {
+        }
+        return error.NoSystemAudioSource;
+    }
+    for (sources) |src| {
+        if (containsIgnoreCase(src.name, want) or containsIgnoreCase(src.description, want)) {
             return gpa.dupeZ(u8, src.name);
         }
     }
-    return if (auto) error.NoSystemAudioSource else error.DeviceNotFound;
+    return error.DeviceNotFound;
+}
+
+/// The monitor of the default output source: `pactl get-default-sink`
+/// (PipeWire and PulseAudio both ship it; the Tauri GhostPen resolved Auto
+/// the same way) + ".monitor", the name the sound server lists the sink's
+/// loopback under. null: pactl is missing, or the sink has no monitor in the
+/// list. Caller frees.
+fn defaultSinkMonitor(sources: []const audio.Source) !?[:0]u8 {
+    const run = std.process.run(gpa, main.io, .{
+        .argv = &.{ "pactl", "get-default-sink" },
+    }) catch |err| {
+        log.debug("default sink: pactl ({s})", .{@errorName(err)});
+        return null;
+    };
+    defer gpa.free(run.stdout);
+    defer gpa.free(run.stderr);
+    const sink = std.mem.trim(u8, run.stdout, " \t\r\n");
+    if (sink.len == 0 or std.ascii.eqlIgnoreCase(sink, "@DEFAULT_SINK@")) return null;
+    var found: ?[:0]u8 = null;
+    for (sources) |src| {
+        if (src.monitor and src.name.len == sink.len + ".monitor".len and
+            std.mem.eql(u8, src.name[0..sink.len], sink) and std.mem.eql(u8, src.name[sink.len..], ".monitor"))
+            found = try gpa.dupeZ(u8, src.name);
+    }
+    if (found == null) log.debug("no monitor source for the default sink {s}", .{sink});
+    return found;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

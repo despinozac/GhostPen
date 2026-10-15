@@ -398,7 +398,10 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
     if (!models.isDownloaded(main.io, gpa, c.model))
         return oriel.ipc.fail("Whisper model \"{s}\" isn't downloaded yet. Download it in Settings → Captions.", .{c.model});
 
-    const source = if (models.test_audio != null) try gpa.dupeZ(u8, "test-audio") else pickSource(c.device) catch |err| return switch (err) {
+    const source = if (models.test_audio != null) try gpa.dupeZ(u8, "test-audio") else pickSource(c.device) catch |err| return switch (@as(anyerror, err)) {
+        // anyerror: on Windows "Auto" is always the loopback, so pickSource
+        // can't return NoSystemAudioSource there (v0.2.25's Windows build
+        // failed on it).
         error.NoSystemAudioSource => oriel.ipc.fail("No system-audio source found (on macOS, install a loopback device such as BlackHole).", .{}),
         error.DeviceNotFound => oriel.ipc.fail("Audio device \"{s}\" not found.", .{c.device}),
         else => oriel.ipc.fail("Could not list audio devices ({s}).", .{@errorName(err)}),

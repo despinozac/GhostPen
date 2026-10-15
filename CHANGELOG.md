@@ -34,6 +34,9 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 - Through speakers instead of a headset the microphone hears the call:
   those lines are recognized as the others' (the same words at the same
   moment) and dropped, live and in the saved transcript.
+- The Windows build compiles again: 0.2.25's didn't, and that release was
+  never published, so its live-captions fix ("Auto" follows the current
+  output) reaches every platform with this one.
 - Non-streamed answers from an OpenAI-compatible endpoint shorter than
   4 KiB came back as "Parse error" (dictation's proofread through Ollama,
   among others): the response was never flushed out of its buffer.

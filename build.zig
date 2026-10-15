@@ -3,7 +3,7 @@ const oriel = @import("oriel");
 
 /// GhostPen's version: the packages, `ghostpen --version`, Settings → About
 /// and the updater all read it from here.
-const version = "0.2.25";
+const version = "0.3.0";
 
 /// Public half of the release signing key (the private half is the
 /// GHOSTPEN_UPDATE_KEY secret the release workflow signs latest.json with).
@@ -34,6 +34,8 @@ pub fn build(b: *std.Build) void {
         // Text to speech (oriel.tts, wired in src/tts.zig): Kokoro on the GPU with
         // -Dvulkan/-Dcuda, else the CPU; ships the espeak-ng phoneme data.
         .kokoro = true,
+        // Speakers by voice in meetings (src/speakers.zig): oriel.speakers on the whisper ggml tree.
+        .speakers = true,
         // Images for vision models (their mmproj projector): Extract Text on Built-in profiles.
         .llama_mtmd = true,
         .audio_capture = true,
@@ -60,7 +62,8 @@ pub fn build(b: *std.Build) void {
         .updater = true,
         .sql = false,
         .fs_watch = false,
-        .media_server = false,
+        // The Meetings window plays recordings over 127.0.0.1 (src/meetings.zig).
+        .media_server = true,
     });
 
     // Frontend in frontend/ (npm install if needed, vite build, embed).

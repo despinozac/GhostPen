@@ -4,6 +4,45 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
+### Added
+
+- **Meetings.** Turn on **🎙 Meeting** in the captions bar and Start: the
+  captions also record what your computer plays and your microphone
+  ("Me"). Stop saves the meeting in `Documents/GhostPen/Meetings/` (the
+  localized Documents folder on Linux): the whole audio is transcribed
+  again with word timings, the speakers are told apart by voice, your AI
+  profile proofreads it into a clean text and gives it a title, and a
+  notification says it's saved. Each meeting folder holds `audio.wav`,
+  `meeting.json`, `transcript.md` and `final.md`.
+- **The Meetings window** (tray → Meetings): search the meetings, play one
+  with the word being said highlighted, click a line to play from it,
+  rename and merge speakers, move a line to another speaker, edit lines,
+  copy as text, Markdown or subtitles, proofread or find the speakers
+  again, open the folder, delete (also from a right-click on the list).
+- **Speakers by voice** (Oriel's `oriel.speakers`, the WeSpeaker ResNet34
+  model, 26 MB, downloaded the first time): live labels in the captions,
+  one line per speaker, and on save the whole meeting. Name a speaker and
+  pick **Remember this voice**: later meetings name them by themselves.
+- Settings → Speech → Meetings: meeting mode by default, the microphone,
+  the proofread, speakers by voice, live labels, how many people there
+  are, the speaker model and the folder.
+
+### Fixed
+
+- Through speakers instead of a headset the microphone hears the call:
+  those lines are recognized as the others' (the same words at the same
+  moment) and dropped, live and in the saved transcript.
+- Non-streamed answers from an OpenAI-compatible endpoint shorter than
+  4 KiB came back as "Parse error" (dictation's proofread through Ollama,
+  among others): the response was never flushed out of its buffer.
+
+### Changed
+
+- Built on Oriel 0.17.0.
+- Every captions Start begins with an empty overlay.
+
 ## [0.2.25] - 2026-10-14
 
 ### Fixed

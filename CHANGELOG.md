@@ -4,7 +4,9 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-15
+## [0.3.1] - 2026-10-15
+
+The first release with meetings (0.3.0 was tagged but never published).
 
 ### Added
 

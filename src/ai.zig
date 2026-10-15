@@ -171,6 +171,9 @@ fn exchange(
                 },
                 .response_writer = w,
             });
+            // fetch never flushes the writer: a body shorter than its buffer
+            // (a short non-streamed answer) would never reach the sink.
+            try w.flush();
             return res.status;
         }
         fn sleep(i: std.Io, ms: u32) void {

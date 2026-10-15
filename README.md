@@ -79,6 +79,30 @@ ghostpen-cli translate --lang French --stream "Good morning"
 ghostpen-cli profiles
 ```
 
+## Meetings
+
+Turn on **🎙 Meeting** in the captions bar, then Start: the captions also
+record what your computer plays and your microphone ("Me"). Stop saves the
+meeting in `Documents/GhostPen/Meetings/<date>_<time>/`: the whole audio is
+transcribed again (more accurately than the live captions), the speakers
+are told apart by voice, and your AI profile proofreads it into a clean
+text, with a title. **Tray → Meetings** lists them: play one and the line
+being said is highlighted, click a line to play from it, rename speakers
+(every line follows), merge them, move a line to another speaker, edit the
+text, copy it as text, Markdown or subtitles, or proofread and find the
+speakers again. Name a speaker and pick **Remember this voice**: later
+meetings name them by themselves, live in the captions too.
+
+Through speakers instead of a headset the microphone hears the call: those
+lines are recognized as the others' (same words, same moment) and dropped.
+Each meeting folder holds `audio.wav`, `meeting.json`, `transcript.md` and
+`final.md`; nothing leaves the machine except the text sent to your AI
+profile for the proofread.
+
+Speakers come from Oriel's `oriel.speakers` (voice-detect.cpp) and the
+WeSpeaker ResNet34 model trained on VoxCeleb (WeSpeaker, CC-BY-4.0;
+downloaded the first time, 26 MB, SHA-256 verified).
+
 ## Read aloud (the built-in voice)
 
 A Kokoro-82M voice runs inside the app, on this computer, no network. When a

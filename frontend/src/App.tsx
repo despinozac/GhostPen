@@ -9,6 +9,7 @@ const Playground = lazy(() => import("./Playground"));
 const Captions = lazy(() => import("./Captions"));
 const Dictation = lazy(() => import("./Dictation"));
 const Summary = lazy(() => import("./Summary"));
+const Meetings = lazy(() => import("./Meetings"));
 
 function route(): string {
   // "#/settings" → "/settings", default "/"
@@ -21,6 +22,7 @@ function Page({ path }: { path: string }) {
   if (path.startsWith("/captions")) return <Captions />;
   if (path.startsWith("/dictation")) return <Dictation />;
   if (path.startsWith("/summary")) return <Summary />;
+  if (path.startsWith("/meetings")) return <Meetings />;
   return <Menu />;
 }
 

@@ -12,4 +12,8 @@ test {
     _ = @import("model_server.zig");
     _ = @import("web_page.zig");
     _ = @import("tts.zig");
+    _ = @import("wav.zig");
+    _ = @import("meeting_store.zig");
+    _ = @import("meetings.zig");
+    _ = @import("voices.zig");
 }

@@ -102,6 +102,30 @@ a GPU) and download it once. Captions can be translated to English by
 whisper, or to any language by your AI profile. On macOS, captions need a
 loopback device such as BlackHole to hear the system audio.
 
+## Meetings
+
+Turn on **🎙 Meeting** in the captions bar, then **Start**. The captions
+also record what your computer plays and your microphone (shown as
+"Me"), and label the other speakers by voice as they talk. **Stop & save**
+(or `Esc`, or the hotkey) saves the meeting: the whole audio is
+transcribed again with the time of each word, the speakers are told
+apart by voice, and your AI profile proofreads it into a clean text with
+a title. A notification says when it's ready.
+
+**Tray → Meetings** lists them. Press play and the word being said is
+highlighted; click a line to play from it, double-click to edit it. Click
+a speaker to rename them (every line follows); their menu merges them
+into another speaker or remembers their voice, so later meetings name
+them by themselves. **Copy** gives the clean text, Markdown or subtitles;
+**Redo** proofreads or finds the speakers again; right-click a meeting to
+rename or delete it.
+
+Use a headset if you can: through speakers the microphone hears the call
+too. GhostPen drops those lines (same words, same moment), but a headset
+keeps your track clean. The speaker model (WeSpeaker, 26 MB) downloads the
+first time a meeting is saved; **Settings → Speech → Meetings** has the
+options.
+
 ## Dictation
 
 `Ctrl+Shift+D`, speak, then
@@ -189,6 +213,8 @@ ghostpen-cli models
 | Settings | `~/.config/dev.ghostpen.Oriel/` | `%APPDATA%\dev.ghostpen.Oriel\` | `~/Library/Application Support/dev.ghostpen.Oriel/` |
 | Models (whisper, built-in) | `~/.local/share/GhostPen/models/` | `%LOCALAPPDATA%\GhostPen\models\` | `~/Library/Application Support/GhostPen/models/` |
 | Voices (read aloud) | `~/.local/share/GhostPen/tts/` | `%LOCALAPPDATA%\GhostPen\tts\` | `~/Library/Application Support/GhostPen/tts/` |
+| Meetings | `~/Documents/GhostPen/Meetings/` (your Documents folder) | `%USERPROFILE%\Documents\GhostPen\Meetings\` | `~/Documents/GhostPen/Meetings/` |
+| Known voices | `~/.local/share/GhostPen/voices.json` | `%LOCALAPPDATA%\GhostPen\voices.json` | `~/Library/Application Support/GhostPen/voices.json` |
 
 Settings from the earlier Rust/Tauri GhostPen are imported on the first
 start, and its downloaded whisper models are reused.

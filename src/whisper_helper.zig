@@ -40,11 +40,14 @@ const Request = struct {
     language: []const u8 = "auto",
     translate: bool = false,
     segments: bool = false,
+    /// Each segment's words with their times (whisper's token timestamps).
+    words: bool = false,
     vad: ?[]const u8 = null,
     samples: u64 = 0,
 };
 
-const Segment = struct { start: f64, end: f64, text: []const u8 };
+const Word = struct { start: f64, end: f64, text: []const u8 };
+const Segment = struct { start: f64, end: f64, text: []const u8, words: []const Word = &.{} };
 
 /// A request line (paths and a language: small).
 const max_line_bytes = 64 * 1024;
@@ -70,6 +73,8 @@ fn sendError(id: u64, message: []const u8) void {
 const Loaded = struct {
     ctx: whisper.Context,
     path: []u8,
+    /// Loaded with DTW token timestamps (`ensureModelFor`).
+    dtw: bool = false,
 };
 
 pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -136,7 +141,7 @@ pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8
                 return 1;
             };
             in.readSliceAll(std.mem.sliceAsBytes(samples)) catch return 0;
-            const ctx = ensureModel(gpa, &loaded, req.model) catch |err| {
+            const ctx = ensureModelFor(gpa, &loaded, req.model, req.words) catch |err| {
                 sendError(req.id, modelError(err));
                 continue;
             };
@@ -160,8 +165,16 @@ fn modelError(err: anyerror) []const u8 {
 
 /// The model at `path`, loaded (swapping out another) unless it's resident.
 fn ensureModel(gpa: std.mem.Allocator, loaded: *?Loaded, path: []const u8) !whisper.Context {
+    return ensureModelFor(gpa, loaded, path, false);
+}
+
+/// `words`: the model with DTW token timestamps (word times aligned on the
+/// audio; whisper's own token times drift across a long segment). That
+/// needs flash attention off, so captions keep a context without it and a
+/// meeting's save loads this one.
+fn ensureModelFor(gpa: std.mem.Allocator, loaded: *?Loaded, path: []const u8, words: bool) !whisper.Context {
     if (path.len == 0) return error.NoModel;
-    if (loaded.*) |l| if (std.mem.eql(u8, l.path, path)) return l.ctx;
+    if (loaded.*) |l| if (std.mem.eql(u8, l.path, path) and l.dtw == words) return l.ctx;
     const pz = try gpa.dupeZ(u8, path);
     defer gpa.free(pz);
     // One model at a time (GPU memory): the old one goes first.
@@ -170,14 +183,78 @@ fn ensureModel(gpa: std.mem.Allocator, loaded: *?Loaded, path: []const u8) !whis
         gpa.free(l.path);
         loaded.* = null;
     }
-    const ctx = try whisper.loadModel(pz, whisper.contextDefaultParams());
+    var params = whisper.contextDefaultParams();
+    if (words) if (alignmentHeads(std.fs.path.basename(path))) |preset| {
+        params.dtw_token_timestamps = true;
+        params.dtw_aheads_preset = preset;
+        params.flash_attn = false;
+    };
+    const ctx = try whisper.loadModel(pz, params);
     errdefer ctx.deinit();
-    loaded.* = .{ .ctx = ctx, .path = try gpa.dupe(u8, path) };
+    loaded.* = .{ .ctx = ctx, .path = try gpa.dupe(u8, path), .dtw = words };
     return ctx;
+}
+
+/// whisper.cpp's alignment heads for a model file ("ggml-large-v3-turbo-q5_0.bin"),
+/// or null for one it has none for (its words keep whisper's own times).
+fn alignmentHeads(file: []const u8) ?c.enum_whisper_alignment_heads_preset {
+    const name = if (std.mem.startsWith(u8, file, "ggml-")) file["ggml-".len..] else file;
+    const presets = [_]struct { prefix: []const u8, preset: c.enum_whisper_alignment_heads_preset }{
+        // Longest first: "large-v3-turbo" before "large-v3", ".en" before the rest.
+        .{ .prefix = "large-v3-turbo", .preset = c.WHISPER_AHEADS_LARGE_V3_TURBO },
+        .{ .prefix = "large-v3", .preset = c.WHISPER_AHEADS_LARGE_V3 },
+        .{ .prefix = "large-v2", .preset = c.WHISPER_AHEADS_LARGE_V2 },
+        .{ .prefix = "large-v1", .preset = c.WHISPER_AHEADS_LARGE_V1 },
+        .{ .prefix = "medium.en", .preset = c.WHISPER_AHEADS_MEDIUM_EN },
+        .{ .prefix = "medium", .preset = c.WHISPER_AHEADS_MEDIUM },
+        .{ .prefix = "small.en", .preset = c.WHISPER_AHEADS_SMALL_EN },
+        .{ .prefix = "small", .preset = c.WHISPER_AHEADS_SMALL },
+        .{ .prefix = "base.en", .preset = c.WHISPER_AHEADS_BASE_EN },
+        .{ .prefix = "base", .preset = c.WHISPER_AHEADS_BASE },
+        .{ .prefix = "tiny.en", .preset = c.WHISPER_AHEADS_TINY_EN },
+        .{ .prefix = "tiny", .preset = c.WHISPER_AHEADS_TINY },
+    };
+    for (presets) |p| if (std.mem.startsWith(u8, name, p.prefix)) return p.preset;
+    return null;
 }
 
 fn threads() c_int {
     return @intCast(@min(std.Thread.getCpuCount() catch 4, 8));
+}
+
+/// A segment's words from its tokens: a token starting with a space starts
+/// a word; special tokens (timestamps, end of text) are skipped. Times in
+/// seconds, like the segments'. With DTW (`t_dtw` set) a word starts at
+/// its first token's aligned time and ends where the next word starts.
+fn segmentWords(arena: std.mem.Allocator, ctx: whisper.Context, seg: c_int) ![]const Word {
+    const eot = c.whisper_token_eot(ctx.handle);
+    var out: std.ArrayList(Word) = .empty;
+    var cur: std.ArrayList(u8) = .empty;
+    var start: f64 = 0;
+    var end: f64 = 0;
+    var dtw = false;
+    const n: usize = @intCast(@max(0, c.whisper_full_n_tokens(ctx.handle, seg)));
+    for (0..n) |k| {
+        const data = c.whisper_full_get_token_data(ctx.handle, seg, @intCast(k));
+        if (data.id >= eot) continue;
+        const piece: []const u8 = if (c.whisper_full_get_token_text(ctx.handle, seg, @intCast(k))) |x| std.mem.span(x) else continue;
+        if (piece.len == 0) continue;
+        dtw = data.t_dtw >= 0;
+        const t0 = @as(f64, @floatFromInt(if (dtw) data.t_dtw else data.t0)) / 100.0;
+        const t1 = @as(f64, @floatFromInt(data.t1)) / 100.0;
+        if (piece[0] == ' ' and cur.items.len > 0) {
+            try out.append(arena, .{ .start = start, .end = if (dtw) t0 else end, .text = try cur.toOwnedSlice(arena) });
+        }
+        if (cur.items.len == 0) start = t0;
+        try cur.appendSlice(arena, std.mem.trimStart(u8, piece, " "));
+        end = if (dtw) @max(t0, start) else t1;
+    }
+    if (cur.items.len > 0) {
+        // The last word: to the segment's end (DTW gives starts only).
+        const seg_end = @as(f64, @floatFromInt(c.whisper_full_get_segment_t1(ctx.handle, seg))) / 100.0;
+        try out.append(arena, .{ .start = start, .end = if (dtw) @max(start + 0.2, @min(seg_end, start + 1.5)) else end, .text = try cur.toOwnedSlice(arena) });
+    }
+    return out.items;
 }
 
 fn transcribe(arena: std.mem.Allocator, ctx: whisper.Context, req: Request, samples: []const f32) !void {
@@ -185,7 +262,8 @@ fn transcribe(arena: std.mem.Allocator, ctx: whisper.Context, req: Request, samp
     const lang = try arena.dupeZ(u8, if (req.language.len == 0) "auto" else req.language);
     const vad: ?[:0]const u8 = if (req.vad) |v| try arena.dupeZ(u8, v) else null;
     // With VAD, whisper.cpp maps segment times back onto the original audio.
-    const p = whisper.fullParams(.{ .language = lang, .translate = req.translate, .threads = threads(), .vad_model = vad });
+    var p = whisper.fullParams(.{ .language = lang, .translate = req.translate, .threads = threads(), .vad_model = vad });
+    p.token_timestamps = req.words;
     if (c.whisper_full(ctx.handle, p, samples.ptr, n_samples) != 0) return error.TranscribeFailed;
 
     const n: usize = @intCast(@max(0, c.whisper_full_n_segments(ctx.handle)));
@@ -200,6 +278,7 @@ fn transcribe(arena: std.mem.Allocator, ctx: whisper.Context, req: Request, samp
             .start = @as(f64, @floatFromInt(c.whisper_full_get_segment_t0(ctx.handle, idx))) / 100.0,
             .end = @as(f64, @floatFromInt(c.whisper_full_get_segment_t1(ctx.handle, idx))) / 100.0,
             .text = t,
+            .words = if (req.words) try segmentWords(arena, ctx, idx) else &.{},
         };
     }
     const lang_id = c.whisper_full_lang_id(ctx.handle);

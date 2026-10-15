@@ -58,11 +58,32 @@ export interface Settings {
   ocr: OcrSettings;
   captions: CaptionsSettings;
   dictation: DictationSettings;
+  meetings?: MeetingsSettings;
   localLlm: LocalLlmSettings;
   /** Where the model & speech service listens (other local apps). */
   server?: ServerSettings;
   /** Check for updates in the background and install them where possible. */
   autoUpdate: boolean;
+}
+
+/** Meeting mode (MEETINGS.md): captions that record, keep and proofread. */
+export interface MeetingsSettings {
+  /** Captions start in meeting mode. */
+  enabled: boolean;
+  /** Where meetings are saved ("" = Documents/GhostPen/Meetings). */
+  dir: string;
+  /** Record the microphone too (the dictation microphone), as "Me". */
+  mic: boolean;
+  /** Proofread the transcript with the active profile when saving. */
+  proofread: boolean;
+  /** Tell the others apart by voice when saving (speaker model downloaded on first use). */
+  speakers?: boolean;
+  /** The speaker model ("" = the default). */
+  speakerModel?: string;
+  /** How many people besides you, when known (0 = find out). */
+  expectedSpeakers?: number;
+  /** Label speakers live in the captions too. */
+  liveSpeakers?: boolean;
 }
 
 /** The model & speech service (built-in models and transcription, one endpoint). */
@@ -99,12 +120,20 @@ export interface CaptionsStatus {
   translate: boolean;
   /** Target language for AI translation, for the overlay toggle label. */
   target_lang: string;
+  /** Meeting mode for the next start. */
+  meeting: boolean;
+  /** The meeting being recorded, if any. */
+  recording: { id: string; seconds: number } | null;
 }
 
 /** Payload of the `ghostpen://caption` event. */
 export interface Caption {
   text: string;
   translated: boolean;
+  /** "me" for the microphone in meeting mode, a speaker id once recognised, else "". */
+  speaker?: string;
+  /** The speaker's name to show ("" = none). */
+  name?: string;
 }
 
 export interface Status {
@@ -265,6 +294,8 @@ export const captionsSetClickThrough = (enable: boolean) =>
 /** Toggle AI translation live (persists to settings; takes effect on the next chunk). */
 export const captionsSetTranslate = (enable: boolean) =>
   invoke<void>("captions_set_translate", { enable });
+/** Meeting mode for the next start (persists to settings). */
+export const captionsSetMeeting = (enable: boolean) => invoke<void>("captions_set_meeting", { enable });
 /** Download the configured (or a specific) whisper model. May take a while (~140MB for base). */
 export const captionsDownloadModel = (model?: string) =>
   invoke<void>("captions_download_model", { model: model ?? null });
@@ -474,3 +505,110 @@ export const updateCheck = () => invoke<UpdateCheck>("update_check");
 /** Download and install; progress arrives as `ghostpen://update-progress`. */
 export const updateInstall = () => invoke<void>("update_install");
 export const updateRestart = () => invoke<void>("update_restart");
+
+// ---- meetings (MEETINGS.md, src/meetings.zig) ------------------------------------------------
+
+export interface MeetingSpeaker {
+  id: string;
+  name: string;
+  /** A known voice this speaker was matched to or saved as ("" = none). */
+  voice?: string;
+  /** The speaker's voice (embedding centroid); empty until speakers are found by voice. */
+  embedding?: number[];
+}
+
+export interface MeetingWord {
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface MeetingSegment {
+  /** Seconds from the start of the recording. */
+  start: number;
+  end: number;
+  speaker: string;
+  text: string;
+  /** Each word and when it's said (the transcript's lines; not the clean text). */
+  words?: MeetingWord[];
+}
+
+export type MeetingState = "recording" | "saving" | "transcribing" | "diarizing" | "proofreading" | "ready" | "error";
+
+export interface Meeting {
+  version: number;
+  title: string;
+  titleEdited: boolean;
+  startedAt: number;
+  startedLocal: string;
+  durationMs: number;
+  state: MeetingState;
+  message: string;
+  mic: boolean;
+  language: string;
+  model: string;
+  /** The embedding space of the speakers' voices ("" = not found by voice). */
+  voiceFamily?: string;
+  speakers: MeetingSpeaker[];
+  segments: MeetingSegment[];
+  /** The proofread text, one entry per speaker turn. */
+  final: MeetingSegment[];
+}
+
+export interface MeetingSummary {
+  id: string;
+  title: string;
+  startedAt: number;
+  startedLocal: string;
+  durationMs: number;
+  state: MeetingState;
+  speakers: number;
+  preview: string;
+}
+
+export interface MeetingDetail {
+  id: string;
+  meeting: Meeting;
+  /** The audio's URL (127.0.0.1 media server); "" while recording. */
+  audio: string;
+  folder: string;
+  /** Being recorded or processed: not editable yet. */
+  busy: boolean;
+}
+
+/** Payload of `ghostpen://meeting`: the save pipeline's progress (0–1 within the state). */
+export interface MeetingProgress {
+  id: string;
+  state: MeetingState;
+  progress: number;
+  message: string;
+}
+
+export type MeetingEdit = Partial<Pick<Meeting, "title" | "speakers" | "segments" | "final">>;
+export type MeetingExport = "transcript" | "final" | "srt" | "text";
+
+export const openMeetings = () => invoke<void>("open_meetings");
+export const meetingsList = (query = "") => invoke<MeetingSummary[]>("meetings_list", { query });
+export const meetingsGet = (id: string) => invoke<MeetingDetail>("meetings_get", { id });
+export const meetingsUpdate = (id: string, edit: MeetingEdit) => invoke<Meeting>("meetings_update", { id, ...edit });
+export const meetingsDelete = (id: string) => invoke<void>("meetings_delete", { id });
+/** Run a step again: "transcribe" (and what follows), "speakers" or "proofread". */
+export const meetingsReprocess = (id: string, step: "transcribe" | "speakers" | "proofread") =>
+  invoke<void>("meetings_reprocess", { id, step });
+export const meetingsExport = (id: string, format: MeetingExport) => invoke<string>("meetings_export", { id, format });
+/** Open a meeting's folder (or, without an id, the meetings folder) in the file manager. */
+export const meetingsOpenFolder = (id = "") => invoke<void>("meetings_open_folder", { id });
+/** Stop serving the recordings (the window was hidden). */
+export const meetingsReleaseAudio = () => invoke<void>("meetings_release_audio");
+export const meetingsFolder = () => invoke<string>("meetings_folder");
+
+export interface KnownVoice {
+  name: string;
+  /** How many meetings taught it. */
+  meetings: number;
+  family: string;
+}
+export const meetingsVoices = () => invoke<KnownVoice[]>("meetings_voices");
+/** Remember a speaker's voice under their name: later meetings label them by it. */
+export const meetingsRememberVoice = (id: string, speaker: string) => invoke<Meeting>("meetings_remember_voice", { id, speaker });
+export const meetingsForgetVoice = (name: string) => invoke<void>("meetings_forget_voice", { name });

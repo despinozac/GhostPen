@@ -494,7 +494,7 @@ fn transcriptionReply(io: std.Io, arena: std.mem.Allocator, request: *std.http.S
         },
     };
     const model = currentModel(arena);
-    const transcript = try models.transcribeSegments(io, gpa, arena, model, samples, language);
+    const transcript = try models.transcribeSegments(io, gpa, arena, model, samples, language, false);
     const duration = @as(f64, @floatFromInt(samples.len)) / @as(f64, @floatFromInt(models.sample_rate));
 
     if (std.mem.eql(u8, format, "text")) return .{ .body = try transcript.text(arena), .content_type = "text/plain; charset=utf-8" };

@@ -159,11 +159,15 @@ pub fn transcribe(io: std.Io, gpa: std.mem.Allocator, id: []const u8, samples: [
     return gpa.dupe(u8, r.text);
 }
 
+pub const Word = struct { start: f64 = 0, end: f64 = 0, text: []const u8 = "" };
+
 pub const Segment = struct {
     /// Seconds from the start of the audio.
     start: f64,
     end: f64,
     text: []const u8,
+    /// When asked for: the words and their times (whisper's token timestamps).
+    words: []const Word = &.{},
 };
 
 pub const Transcript = struct {
@@ -186,7 +190,7 @@ pub const Transcript = struct {
 
 /// Transcribe with segment timestamps (the STT server's verbose_json, srt
 /// and vtt). Same runner and lock as `transcribe`. Results point into `arena`.
-pub fn transcribeSegments(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, id: []const u8, samples: []const f32, language: []const u8) !Transcript {
+pub fn transcribeSegments(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, id: []const u8, samples: []const f32, language: []const u8, words: bool) !Transcript {
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     const p = (try resolve(io, gpa, id)) orelse return error.ModelNotFound;
@@ -197,10 +201,11 @@ pub fn transcribeSegments(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.All
         .model = p,
         .language = if (language.len == 0) "auto" else language,
         .segments = true,
+        .words = words,
         .vad = vadLocked(io, gpa),
     }, samples);
     const segments = try arena.alloc(Segment, r.segments.len);
-    for (segments, r.segments) |*out, seg| out.* = .{ .start = seg.start, .end = seg.end, .text = try cleanTranscript(arena, seg.text) };
+    for (segments, r.segments) |*out, seg| out.* = .{ .start = seg.start, .end = seg.end, .text = try cleanTranscript(arena, seg.text), .words = seg.words };
     return .{ .segments = segments, .language = if (r.language.len > 0) r.language else try arena.dupe(u8, language) };
 }
 
@@ -240,6 +245,7 @@ const Request = struct {
     language: []const u8 = "auto",
     translate: bool = false,
     segments: bool = false,
+    words: bool = false,
     vad: ?[]const u8 = null,
     samples: u64 = 0,
 };
@@ -249,7 +255,12 @@ const Reply = struct {
     @"error": ?[]const u8 = null,
     text: []const u8 = "",
     language: []const u8 = "",
-    segments: []const struct { start: f64 = 0, end: f64 = 0, text: []const u8 = "" } = &.{},
+    segments: []const struct {
+        start: f64 = 0,
+        end: f64 = 0,
+        text: []const u8 = "",
+        words: []const Word = &.{},
+    } = &.{},
 };
 
 /// Send `req` (followed by `samples`) and wait for its answer, starting the

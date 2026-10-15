@@ -8,6 +8,11 @@ const oriel = @import("oriel");
 const main = @import("main.zig");
 const models = @import("models.zig");
 const stt_server = @import("stt_server.zig");
+const meetings = @import("meetings.zig");
+const dictation = @import("dictation.zig");
+const store = @import("meeting_store.zig");
+const voices = @import("voices.zig");
+const speakers = @import("speakers.zig");
 
 const App = oriel.App;
 const events = main.events;
@@ -23,6 +28,8 @@ var mutex: std.Io.Mutex = .init;
 var session: ?*Session = null;
 /// AI translation on/off, flipped live from the overlay.
 var translate_live: std.atomic.Value(bool) = .init(false);
+/// Meeting mode (MEETINGS.md) for the next start, flipped from the overlay.
+var meeting_live: std.atomic.Value(bool) = .init(false);
 
 pub fn init() void {
     // Whisper and its GPU backend run in the runner (models.zig), started on
@@ -31,7 +38,10 @@ pub fn init() void {
     if (builtin.os.tag == .macos) if (std.Thread.spawn(.{}, warmUpMetal, .{})) |t| t.detach() else |_| {};
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    if (main.shared.get(main.io, arena.allocator())) |s| translate_live.store(s.captions.aiTranslate, .release) else |_| {}
+    if (main.shared.get(main.io, arena.allocator())) |s| {
+        translate_live.store(s.captions.aiTranslate, .release);
+        meeting_live.store(s.meetings.enabled, .release);
+    } else |_| {}
 }
 
 /// macOS: Metal compiles whisper's GPU code the first time a new build of
@@ -64,6 +74,7 @@ pub fn settingsChanged() void {
         defer arena.deinit();
         const s = main.shared.get(main.io, arena.allocator()) catch break :init_translate;
         translate_live.store(s.captions.aiTranslate, .release);
+        meeting_live.store(s.meetings.enabled, .release);
     }
 }
 
@@ -93,6 +104,23 @@ const Session = struct {
     whisper_translate: bool,
     chunk_samples: usize,
     target_lang: []u8,
+    /// Meeting mode: the recording the tracks go to (ended by destroy).
+    rec: ?*meetings.Recording = null,
+    /// Meeting mode with the microphone: its source (null = the default
+    /// input), thread and captions buffer.
+    mic: bool = false,
+    mic_source: ?[:0]u8 = null,
+    mic_thread: ?std.Thread = null,
+    mic_samples: std.ArrayList(f32) = .empty,
+    /// The last system-audio captions (worker thread only): a mic caption
+    /// that repeats them is the call heard through the speakers.
+    recent: [3][]u8 = .{ &.{}, &.{}, &.{} },
+    /// Live speaker labels (meeting mode): the speakers heard so far, the
+    /// known voices, and the speaker model ("" = no live labels).
+    tracker: voices.Tracker = .{ .gpa = gpa },
+    known: std.heap.ArenaAllocator = .init(gpa),
+    known_voices: []const voices.Voice = &.{},
+    speaker_model: []u8 = &.{},
 
     /// All fields owned; on failure nothing leaks.
     fn create(source: [:0]const u8, c: @import("settings.zig").Captions) !*Session {
@@ -123,8 +151,17 @@ const Session = struct {
     fn destroy(s: *Session) void {
         s.running.store(false, .release);
         if (s.capture_thread) |t| t.join();
+        if (s.mic_thread) |t| t.join();
         if (s.worker_thread) |t| t.join();
+        // After the threads: nothing writes the tracks any more.
+        if (s.rec) |r| r.end();
         s.samples.deinit(gpa);
+        s.mic_samples.deinit(gpa);
+        for (s.recent) |r| gpa.free(r);
+        s.tracker.deinit();
+        s.known.deinit();
+        gpa.free(s.speaker_model);
+        if (s.mic_source) |m| gpa.free(m);
         if (s.source) |src| gpa.free(src);
         gpa.free(s.model);
         gpa.free(s.language);
@@ -136,9 +173,44 @@ const Session = struct {
     fn append(s: *Session, part: []const f32) void {
         s.buf_mutex.lockUncancelable(main.io);
         defer s.buf_mutex.unlock(main.io);
-        s.samples.appendSlice(gpa, part) catch return;
-        if (s.samples.items.len > max_buffer) {
-            s.samples.replaceRangeAssumeCapacity(0, s.samples.items.len - max_buffer, &.{});
+        if (s.rec) |r| r.writeOthers(part);
+        appendTo(&s.samples, part);
+    }
+
+    fn appendMic(s: *Session, part: []const f32) void {
+        s.buf_mutex.lockUncancelable(main.io);
+        defer s.buf_mutex.unlock(main.io);
+        if (s.rec) |r| r.writeMe(part);
+        appendTo(&s.mic_samples, part);
+    }
+
+    fn appendTo(list: *std.ArrayList(f32), part: []const f32) void {
+        list.appendSlice(gpa, part) catch return;
+        if (list.items.len > max_buffer) {
+            list.replaceRangeAssumeCapacity(0, list.items.len - max_buffer, &.{});
+        }
+    }
+
+    /// Meeting mode: the microphone, as "Me". A microphone that won't open
+    /// leaves the meeting with system audio only.
+    fn micLoop(s: *Session) void {
+        var stream = audio.Stream.open(s.mic_source, "GhostPen meeting microphone", rate) catch |err| {
+            log.warn("open the microphone: {s}", .{@errorName(err)});
+            emitError("The microphone didn't open ({s}): recording system audio only.", .{@errorName(err)});
+            s.buf_mutex.lockUncancelable(main.io);
+            s.mic = false;
+            if (s.rec) |r| meetings.dropMic(r);
+            s.buf_mutex.unlock(main.io);
+            return;
+        };
+        defer stream.close();
+        var buf: [read_chunk]f32 = undefined;
+        while (s.running.load(.acquire)) {
+            stream.read(&buf) catch |err| {
+                emitError("The microphone stopped ({s}).", .{@errorName(err)});
+                return;
+            };
+            s.appendMic(&buf);
         }
     }
 
@@ -171,36 +243,66 @@ const Session = struct {
     fn workerLoop(s: *Session) void {
         while (s.running.load(.acquire)) {
             main.io.sleep(.fromMilliseconds(200), .awake) catch return;
-            const chunk = s.take() orelse continue;
-            defer gpa.free(chunk);
-
-            var arena: std.heap.ArenaAllocator = .init(gpa);
-            defer arena.deinit();
-            const raw = models.transcribe(main.io, gpa, s.model, chunk, s.language, s.whisper_translate) catch |err| {
-                emitError("Transcription failed ({s}).", .{@errorName(err)});
-                continue;
-            };
-            defer gpa.free(raw);
-            // Silence comes back as "[BLANK_AUDIO]": never show sound tags.
-            const text = models.cleanTranscript(arena.allocator(), raw) catch continue;
-            if (text.len == 0 or !s.running.load(.acquire)) continue;
-
-            if (translate_live.load(.acquire)) {
-                if (main.translateText(arena.allocator(), text, s.target_lang)) |t| {
-                    events.emit(.@"ghostpen://caption", .{ .text = t, .translated = true });
-                    continue;
-                } else |err| log.warn("translation failed ({s}); showing the original", .{@errorName(err)});
+            if (s.take(&s.samples)) |chunk| {
+                defer gpa.free(chunk);
+                s.caption(chunk, false);
             }
-            events.emit(.@"ghostpen://caption", .{ .text = text, .translated = false });
+            if (s.take(&s.mic_samples)) |chunk| {
+                defer gpa.free(chunk);
+                s.caption(chunk, true);
+            }
         }
     }
 
-    /// The buffered audio once there's a chunk's worth, else null. Caller frees.
-    fn take(s: *Session) ?[]f32 {
+    /// Transcribe a chunk (and translate it when asked); emit the caption.
+    fn caption(s: *Session, chunk: []const f32, mic: bool) void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        // The microphone's silence between your turns: not worth a pass.
+        if (mic and store.silent(chunk)) return;
+        const raw = models.transcribe(main.io, gpa, s.model, chunk, s.language, s.whisper_translate) catch |err| {
+            emitError("Transcription failed ({s}).", .{@errorName(err)});
+            return;
+        };
+        defer gpa.free(raw);
+        // Silence comes back as "[BLANK_AUDIO]": never show sound tags.
+        const text = models.cleanTranscript(arena.allocator(), raw) catch return;
+        if (text.len == 0 or !s.running.load(.acquire)) return;
+        var speaker: []const u8 = if (mic) "me" else "";
+        var name: []const u8 = if (mic) "Me" else "";
+        if (!mic) {
+            gpa.free(s.recent[0]);
+            s.recent = .{ s.recent[1], s.recent[2], gpa.dupe(u8, text) catch &.{} };
+            // Meeting mode: who is it, by voice.
+            if (s.speaker_model.len > 0) if (speakers.liveLabel(arena.allocator(), &s.tracker, s.speaker_model, chunk, s.known_voices)) |l| {
+                speaker = std.fmt.allocPrint(arena.allocator(), "s{d}", .{l.index + 1}) catch "";
+                name = l.name;
+            };
+        } else if (s.echoes(arena.allocator(), text)) {
+            log.debug("mic caption dropped as echo: {s}", .{text});
+            return;
+        }
+
+        if (translate_live.load(.acquire)) {
+            if (main.translateText(arena.allocator(), text, s.target_lang)) |t| {
+                events.emit(.@"ghostpen://caption", .{ .text = t, .translated = true, .speaker = speaker, .name = name });
+                return;
+            } else |err| log.warn("translation failed ({s}); showing the original", .{@errorName(err)});
+        }
+        events.emit(.@"ghostpen://caption", .{ .text = text, .translated = false, .speaker = speaker, .name = name });
+    }
+
+    fn echoes(s: *Session, arena: std.mem.Allocator, text: []const u8) bool {
+        const recent = std.mem.join(arena, " ", &s.recent) catch return false;
+        return store.echoScore(text, recent) >= store.echo_threshold;
+    }
+
+    /// `list`'s audio once there's a chunk's worth, else null. Caller frees.
+    fn take(s: *Session, list: *std.ArrayList(f32)) ?[]f32 {
         s.buf_mutex.lockUncancelable(main.io);
         defer s.buf_mutex.unlock(main.io);
-        if (s.samples.items.len < s.chunk_samples) return null;
-        const out = s.samples.toOwnedSlice(gpa) catch return null;
+        if (list.items.len < s.chunk_samples) return null;
+        const out = list.toOwnedSlice(gpa) catch return null;
         return out;
     }
 };
@@ -305,9 +407,36 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
     models.ensure(main.io, gpa, c.model) catch |err| return oriel.ipc.fail("Could not load the whisper model \"{s}\" ({s}).", .{ c.model, @errorName(err) });
 
     const sess = try Session.create(source, c);
+    // A meeting that fails to start records under a second: destroy()
+    // removes its folder again.
     errdefer sess.destroy();
     translate_live.store(c.aiTranslate, .release);
+    if (meeting_live.load(.acquire)) {
+        const with_mic = s.meetings.mic and models.test_audio == null;
+        const rec = meetings.begin(with_mic) catch |err| return oriel.ipc.fail("Could not create the meeting's folder ({s}).", .{@errorName(err)});
+        sess.rec = rec;
+        // Live labels when the speaker model is already here (never a download mid-meeting).
+        if (speakers.available and s.meetings.speakers and s.meetings.liveSpeakers) {
+            const model = if (s.meetings.speakerModel.len > 0) s.meetings.speakerModel else speakers.default_model;
+            if (speakers.isDownloaded(arena, model)) {
+                sess.speaker_model = try gpa.dupe(u8, model);
+                const path = meetings.voicesPath(arena) catch "";
+                sess.known_voices = (voices.load(main.io, sess.known.allocator(), path) catch voices.File{}).voices;
+            }
+        }
+        if (with_mic) {
+            sess.mic = true;
+            sess.mic_source = dictation.pickMicrophone(s.dictation.device) catch |err| blk: {
+                log.warn("meeting microphone \"{s}\": {s}", .{ s.dictation.device, @errorName(err) });
+                emitError("Microphone \"{s}\" not found: recording system audio only.", .{s.dictation.device});
+                meetings.dropMic(rec);
+                sess.mic = false;
+                break :blk null;
+            };
+        }
+    }
     sess.capture_thread = try std.Thread.spawn(.{}, Session.captureLoop, .{sess});
+    if (sess.mic) sess.mic_thread = try std.Thread.spawn(.{}, Session.micLoop, .{sess});
     // Fail the start (like the Tauri app) when the source doesn't open.
     var waited: u32 = 0;
     while (sess.opened.load(.acquire) == 0 and waited < 3000) : (waited += 20) {
@@ -326,6 +455,7 @@ fn start(arena: std.mem.Allocator) ![]const u8 {
     session = sess;
     mutex.unlock(main.io);
     if (old) |o| o.destroy();
+    events.emit(.@"ghostpen://captions-started", .{});
     return arena.dupe(u8, source);
 }
 
@@ -341,6 +471,8 @@ fn stop() void {
     session = null;
     mutex.unlock(main.io);
     s.running.store(false, .release);
+    // Not recording any more for the overlay; destroy() still closes the tracks.
+    if (s.rec) |r| meetings.markStopped(r);
     if (std.Thread.spawn(.{}, Session.destroy, .{s})) |t| t.detach() else |err| {
         log.warn("cannot spawn the stop thread ({s}): stopping on this one", .{@errorName(err)});
         s.destroy();
@@ -397,6 +529,10 @@ const Status = struct {
     model: []const u8,
     translate: bool,
     target_lang: []const u8,
+    /// Meeting mode for the next start.
+    meeting: bool,
+    /// The meeting being recorded, if any.
+    recording: ?meetings.RecordingStatus,
 };
 
 /// An audio source for the Settings pickers: `name` is what the settings
@@ -433,6 +569,8 @@ pub const Commands = struct {
             .model = s.captions.model,
             .translate = translate_live.load(.acquire),
             .target_lang = s.captions.targetLang,
+            .meeting = meeting_live.load(.acquire),
+            .recording = try meetings.recordingStatus(arena),
         };
     }
 
@@ -469,6 +607,18 @@ pub const Commands = struct {
         };
         main.shared.update(main.io, gpa, Edit{ .enable = args.enable }) catch |err| return oriel.ipc.fail("Could not save the settings ({s}).", .{@errorName(err)});
         translate_live.store(args.enable, .release);
+    }
+
+    /// Meeting mode for the next start (a running session keeps its mode).
+    pub fn captions_set_meeting(_: std.mem.Allocator, args: struct { enable: bool }) !void {
+        const Edit = struct {
+            enable: bool,
+            pub fn apply(self: @This(), s: *main.Settings) void {
+                s.meetings.enabled = self.enable;
+            }
+        };
+        main.shared.update(main.io, gpa, Edit{ .enable = args.enable }) catch |err| return oriel.ipc.fail("Could not save the settings ({s}).", .{@errorName(err)});
+        meeting_live.store(args.enable, .release);
     }
 
     pub fn captions_download_model(arena: std.mem.Allocator, args: struct { model: ?[]const u8 = null }) !void {

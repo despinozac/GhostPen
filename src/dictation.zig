@@ -293,7 +293,7 @@ const Session = struct {
 };
 
 /// The configured microphone (substring match), else the default input.
-fn pickMicrophone(device: []const u8) !?[:0]u8 {
+pub fn pickMicrophone(device: []const u8) !?[:0]u8 {
     const want = std.mem.trim(u8, device, " \t");
     if (want.len == 0 or std.ascii.eqlIgnoreCase(want, "auto") or std.ascii.eqlIgnoreCase(want, "default")) return null;
     const sources = try audio.listSources(gpa);

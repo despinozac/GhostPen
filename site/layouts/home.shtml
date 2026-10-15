@@ -33,7 +33,7 @@
       <div class="feature-subheading"><p class="eyebrow">Beyond the keyboard</p><h3>Speak, listen, read aloud, and read images.</h3></div>
       <div class="feature-board quad" aria-label="Voice, captions, read aloud, and images">
         <article class="feature-card"><div class="card-visual" data-visual="voice"></div><div><h3>Speak. Polish. Copy.</h3><p>Dictate, then polish the transcript using your built-in AI profile. The result is ready on your clipboard.</p></div></article>
-        <article class="feature-card"><div class="card-visual" data-visual="captions"></div><div><h3>Follow every conversation</h3><p>Live captions for meetings, videos, and podcasts, transcribed on your computer with Whisper.</p></div></article>
+        <article class="feature-card"><div class="card-visual" data-visual="captions"></div><div><h3>Follow every conversation</h3><p>Live captions for meetings, videos, and podcasts, transcribed on your computer with Whisper. Meeting mode saves the recording with who said what, a proofread transcript, and a player that follows along.</p></div></article>
         <article class="feature-card"><div class="card-visual" data-visual="read"></div><div><h3>Hear it read aloud</h3><p>Select text, or a result, and GhostPen reads it in a natural voice that runs on your computer, in the language of the text.</p></div></article>
         <article class="feature-card"><div class="card-visual" data-visual="image"></div><div><h3>Turn images into words</h3><p>Copy an image, extract its text with a built-in vision model, then edit or translate it.</p></div></article>
       </div>

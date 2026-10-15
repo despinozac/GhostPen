@@ -17,6 +17,7 @@ const store = @import("store.zig");
 const image = @import("image.zig");
 const captions = @import("captions.zig");
 const dictation = @import("dictation.zig");
+const meetings = @import("meetings.zig");
 const local_llm = @import("local_llm.zig");
 const tts = @import("tts.zig");
 const llm_models = @import("llm_models.zig");
@@ -151,7 +152,10 @@ pub const Events = struct {
     @"ghostpen://done": []const u8,
     @"ghostpen://error": []const u8,
     @"ghostpen://captions-show": struct {},
-    @"ghostpen://caption": struct { text: []const u8, translated: bool },
+    /// A captions session started (any way): the overlay starts empty.
+    @"ghostpen://captions-started": struct {},
+    /// `speaker`: "me" for the microphone in meeting mode, else "".
+    @"ghostpen://caption": struct { text: []const u8, translated: bool, speaker: []const u8 = "", name: []const u8 = "" },
     @"ghostpen://caption-error": []const u8,
     /// `message`: an error that kept the dictated text ("" otherwise).
     @"ghostpen://dictation": struct { text: []const u8, state: []const u8, message: []const u8 = "" },
@@ -175,6 +179,9 @@ pub const Events = struct {
     /// accumulating markdown travels in summary-chunk.
     @"ghostpen://summary-status": struct { state: []const u8, title: []const u8, chars: usize, message: []const u8 },
     @"ghostpen://summary-chunk": []const u8,
+    /// A meeting's save pipeline (src/meetings.zig): its state and progress
+    /// (0–1 within the state); `message` an error or a note.
+    @"ghostpen://meeting": struct { id: []const u8, state: []const u8, progress: f64, message: []const u8 },
 };
 
 /// The typed emitter for `Events` (any thread).
@@ -187,7 +194,7 @@ fn ttsStateChanged(s: tts.State) void {
 
 // ---- built-in models (GhostPen runs them) -------------------------------------------------------
 
-var environ_map: *const std.process.Environ.Map = undefined;
+pub var environ_map: *const std.process.Environ.Map = undefined;
 /// This executable (the runner is it, in helper mode).
 var self_exe: ?[]const u8 = null;
 
@@ -617,6 +624,9 @@ pub const Commands = struct {
         "whisper_download_model",  "whisper_delete_model", "summarize_link",        "summary_state",
         "tts_speak",               "tts_state",            "tts_catalog",           "tts_download",
         "tts_delete",              "tts_warm_up",          "paste_result",
+        "meetings_list",           "meetings_get",         "meetings_update",       "meetings_delete",
+        "meetings_reprocess",      "meetings_export",      "meetings_open_folder",  "meetings_release_audio",
+        "meetings_folder",         "meetings_voices",      "meetings_remember_voice", "meetings_forget_voice",
     };
 
     pub fn get_settings(arena: std.mem.Allocator) !Settings {
@@ -1057,6 +1067,20 @@ pub const Commands = struct {
     pub const dictation_cancel = dictation.Commands.dictation_cancel;
     pub const dictation_set_language = dictation.Commands.dictation_set_language;
     pub const dictation_set_proofread = dictation.Commands.dictation_set_proofread;
+    pub const captions_set_meeting = captions.Commands.captions_set_meeting;
+    pub const open_meetings = meetings.Commands.open_meetings;
+    pub const meetings_list = meetings.Commands.meetings_list;
+    pub const meetings_get = meetings.Commands.meetings_get;
+    pub const meetings_update = meetings.Commands.meetings_update;
+    pub const meetings_delete = meetings.Commands.meetings_delete;
+    pub const meetings_reprocess = meetings.Commands.meetings_reprocess;
+    pub const meetings_export = meetings.Commands.meetings_export;
+    pub const meetings_open_folder = meetings.Commands.meetings_open_folder;
+    pub const meetings_release_audio = meetings.Commands.meetings_release_audio;
+    pub const meetings_folder = meetings.Commands.meetings_folder;
+    pub const meetings_voices = meetings.Commands.meetings_voices;
+    pub const meetings_remember_voice = meetings.Commands.meetings_remember_voice;
+    pub const meetings_forget_voice = meetings.Commands.meetings_forget_voice;
 };
 
 /// The working selection; when the menu hasn't read one, the clipboard
@@ -1126,6 +1150,8 @@ fn onTrayMenu(id: []const u8, _: ?bool) void {
         showWindow("playground", false);
     } else if (eql(u8, id, "summary")) {
         showWindow("summary", false);
+    } else if (eql(u8, id, "meetings")) {
+        showWindow("meetings", false);
     } else if (eql(u8, id, "settings")) {
         showWindow("settings", false);
     } else if (eql(u8, id, "quit")) {
@@ -1150,6 +1176,8 @@ fn handleArgs(args: []const []const u8) void {
             showWindow("playground", false);
         } else if (eql(u8, a, "--summary")) {
             showWindow("summary", false);
+        } else if (eql(u8, a, "--meetings")) {
+            showWindow("meetings", false);
         }
     }
 }
@@ -1168,6 +1196,7 @@ fn setup() !void {
     const windows = [_]App.WindowOptions{
         .{ .label = "settings", .title = "GhostPen Settings", .url = "index.html#/settings", .width = 540, .height = 680, .visible = false, .hide_on_close = true },
         .{ .label = "playground", .title = "GhostPen Playground", .url = "index.html#/playground", .width = 640, .height = 620, .visible = false, .hide_on_close = true },
+        .{ .label = "meetings", .title = "GhostPen Meetings", .url = "index.html#/meetings", .width = 1040, .height = 760, .visible = false, .hide_on_close = true },
         .{ .label = "summary", .title = "GhostPen Summary", .url = "index.html#/summary", .width = 780, .height = 850, .visible = false, .hide_on_close = true },
         .{ .label = "dictation", .title = "GhostPen Dictation", .url = "index.html#/dictation", .width = 520, .height = 200, .resizable = false, .decorations = false, .visible = false, .transparent = true, .always_on_top = true, .skip_taskbar = true, .placement = .{ .anchor = .bottom, .margin = 64 }, .hide_on_close = true, .focus_on_show = false },
         .{ .label = "captions", .title = "GhostPen Captions", .url = "index.html#/captions", .width = 900, .height = 170, .decorations = false, .visible = false, .transparent = true, .always_on_top = true, .skip_taskbar = true, .placement = .{ .anchor = .bottom, .margin = 64 }, .hide_on_close = true, .focus_on_show = false },
@@ -1183,6 +1212,7 @@ fn setup() !void {
             .{ .item = .{ .id = "show", .label = "Show menu" } },
             .{ .item = .{ .id = "dictate", .label = "Dictation" } },
             .{ .item = .{ .id = "captions", .label = "Captions" } },
+            .{ .item = .{ .id = "meetings", .label = "Meetings" } },
             .{ .item = .{ .id = "summary", .label = "Summarize a link" } },
             .{ .item = .{ .id = "playground", .label = "Playground" } },
             .{ .item = .{ .id = "settings", .label = "Settings" } },
@@ -1212,6 +1242,7 @@ fn setup() !void {
 
     captions.init();
     dictation.init();
+    meetings.init();
     // The model service (chat, vision, embeddings, transcription) for other
     // local apps: stt_server.zig, model_server.zig.
     @import("stt_server.zig").maybeStart(io, environ_map);

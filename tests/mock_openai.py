@@ -12,7 +12,14 @@ class H(BaseHTTPRequestHandler):
         user = req["messages"][1]["content"]
         text = user if isinstance(user,str) else user[0]["text"]
         think = req.get("think")
-        if "LEAK" in text and not think: answer = "The user wants me to fix this. <think>x</think>"
+        system = req["messages"][0]["content"]
+        if "meeting transcripts" in system:
+            # The meeting proofread: the numbered lines back, upper-cased, without the speaker.
+            import re
+            answer = "\n".join("[%s] %s" % (m.group(1), m.group(2).upper()) for m in re.finditer(r"^\[(\d+)\] [^:]*: (.*)$", text, re.M))
+        elif "name meeting recordings" in system:
+            answer = "Mock meeting"
+        elif "LEAK" in text and not think: answer = "The user wants me to fix this. <think>x</think>"
         else: answer = "OK: " + text.upper() + (" (thinking)" if think else "")
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type","text/event-stream"); self.end_headers()

@@ -18,6 +18,9 @@ import {
   captionsListDevices,
   dictationListDevices,
   openCaptions,
+  openMeetings,
+  meetingsFolder,
+  type MeetingsSettings,
   PRESETS,
   CAPTION_LANGUAGES,
   TRANSLATE_LANGUAGES,
@@ -112,6 +115,7 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [section, setSection] = useState<SettingsSection>("ai");
   const [capStatus, setCapStatus] = useState<CaptionsStatus | null>(null);
+  const [defaultMeetingsDir, setDefaultMeetingsDir] = useState("");
   const [capDevices, setCapDevices] = useState<AudioDevice[]>([]);
   const [dictDevices, setDictDevices] = useState<AudioDevice[]>([]);
   const [llm, setLlm] = useState<LlmStatus | null>(null);
@@ -137,6 +141,7 @@ export default function Settings() {
       getStatus().then(setStatus).catch(() => {});
       captionsStatus().then(setCapStatus).catch(() => {});
       captionsListDevices().then(setCapDevices).catch(() => {});
+      meetingsFolder().then(setDefaultMeetingsDir).catch(() => {});
       dictationListDevices().then(setDictDevices).catch(() => {});
       llmModelsStatus().then(setLlm).catch(() => {});
     };
@@ -277,6 +282,11 @@ export default function Settings() {
   const captions = settings.captions;
   const updateCaptions = (patch: Partial<CaptionsSettings>) => {
     update({ captions: { ...captions, ...patch } });
+  };
+
+  const meetingsCfg: MeetingsSettings = settings.meetings ?? { enabled: false, dir: "", mic: true, proofread: true, speakers: true, speakerModel: "", expectedSpeakers: 0, liveSpeakers: true };
+  const updateMeetings = (patch: Partial<MeetingsSettings>) => {
+    update({ meetings: { ...meetingsCfg, ...patch } });
   };
 
   const dictation = settings.dictation;
@@ -735,6 +745,63 @@ export default function Settings() {
         </label>
 
         <button className="btn" onClick={() => openCaptions()}>Open captions overlay</button>
+      </section>
+
+      {/* Meetings (captions that record, keep and proofread) */}
+      <section className="card">
+        <h2>Meetings <span className="muted small">record, transcribe and proofread</span></h2>
+        <p className="muted small">
+          In meeting mode (<b>🎙 Meeting</b> on the captions bar) captions also record the audio — and your
+          microphone, as “Me”. When they stop, the meeting is saved: transcribed again in full, its speakers
+          labelled and, if you like, proofread by your AI profile. Use a headset: through speakers the others
+          end up in your microphone too.
+        </p>
+        <label className="checkbox">
+          <input type="checkbox" checked={meetingsCfg.enabled} onChange={(e) => updateMeetings({ enabled: e.target.checked })} />
+          Start captions in meeting mode
+        </label>
+        <label className="checkbox">
+          <input type="checkbox" checked={meetingsCfg.mic} onChange={(e) => updateMeetings({ mic: e.target.checked })} />
+          Record my microphone too <span className="muted">(the dictation microphone below)</span>
+        </label>
+        <label className="checkbox">
+          <input type="checkbox" checked={meetingsCfg.proofread} onChange={(e) => updateMeetings({ proofread: e.target.checked })} />
+          Proofread the transcript with the AI profile when saving <span className="muted">(a clean text next to the transcript)</span>
+        </label>
+        <label className="checkbox">
+          <input type="checkbox" checked={meetingsCfg.speakers ?? true} onChange={(e) => updateMeetings({ speakers: e.target.checked })} />
+          Tell the speakers apart by voice <span className="muted">(a speaker model, 26 MB, downloaded the first time)</span>
+        </label>
+        {(meetingsCfg.speakers ?? true) && (
+          <>
+            <label className="checkbox">
+              <input type="checkbox" checked={meetingsCfg.liveSpeakers ?? true} onChange={(e) => updateMeetings({ liveSpeakers: e.target.checked })} />
+              Label them live in the captions too <span className="muted">(a guess; saving redoes it over the whole meeting)</span>
+            </label>
+            <label>
+              People besides you
+              <select value={meetingsCfg.expectedSpeakers ?? 0} onChange={(e) => updateMeetings({ expectedSpeakers: parseInt(e.target.value, 10) })}>
+                <option value={0}>Find out</option>
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+              <span className="muted small">When you know it, it helps when two voices sound alike.</span>
+            </label>
+            <label>
+              Speaker model
+              <select value={meetingsCfg.speakerModel ?? ""} onChange={(e) => updateMeetings({ speakerModel: e.target.value })}>
+                <option value="">WeSpeaker ResNet34, VoxCeleb (recommended, 26 MB)</option>
+                <option value="ecapa-tdnn-voxceleb">ECAPA-TDNN, VoxCeleb (64 MB; tells voices apart less well here)</option>
+              </select>
+              <span className="muted small">Known voices are kept per model: switching models means naming people again.</span>
+            </label>
+          </>
+        )}
+        <label>
+          Folder
+          <input value={meetingsCfg.dir} placeholder={defaultMeetingsDir || "Documents/GhostPen/Meetings"} onChange={(e) => updateMeetings({ dir: e.target.value })} />
+          <span className="muted small">Empty = the default above. Each meeting is a folder with the audio, meeting.json and Markdown.</span>
+        </label>
+        <button className="btn" onClick={() => openMeetings()}>Open Meetings</button>
       </section>
 
       {/* Voice dictation (microphone) */}

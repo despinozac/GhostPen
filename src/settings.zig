@@ -82,6 +82,27 @@ pub const Dictation = struct {
     paste: bool = true,
 };
 
+/// Meeting mode (MEETINGS.md): captions that record, keep and proofread.
+pub const Meetings = struct {
+    /// Captions start in meeting mode (the overlay's toggle changes it).
+    enabled: bool = false,
+    /// Where meetings are saved ("" = Documents/GhostPen/Meetings).
+    dir: []const u8 = "",
+    /// Record the microphone too (`dictation.device`), as "Me".
+    mic: bool = true,
+    /// Proofread the transcript with the active profile when saving.
+    proofread: bool = true,
+    /// Tell the others apart by voice when saving (a speaker model, downloaded
+    /// on first use), and name the known voices.
+    speakers: bool = true,
+    /// The speaker model (oriel.speakers catalog id; "" = the default).
+    speakerModel: []const u8 = "",
+    /// How many people besides you, when known (0 = find out).
+    expectedSpeakers: u32 = 0,
+    /// Label the speakers live in the captions too (less accurate than on save).
+    liveSpeakers: bool = true,
+};
+
 pub const Settings = struct {
     hotkey: []const u8 = "Ctrl+Shift+A",
     dictationHotkey: []const u8 = "Ctrl+Shift+D",
@@ -97,6 +118,7 @@ pub const Settings = struct {
     ocr: Ocr = .{},
     captions: Captions = .{},
     dictation: Dictation = .{},
+    meetings: Meetings = .{},
     localLlm: LocalLlm = .{},
     /// The model & speech service's address and port.
     server: Server = .{},

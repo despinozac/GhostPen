@@ -4,6 +4,24 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-15
+
+### Added
+
+- **Meeting summaries.** The Meetings window's **Summary** tab writes an
+  overview, key points, decisions, action items and open questions with
+  your AI profile, saved with the meeting and as `summary.md`. A long
+  meeting (an hour or more) is read in parts and then summarized as a
+  whole, sized to the model's context. Settings → Speech → Meetings can
+  summarize every meeting when it's saved.
+- **Questions about a meeting.** Ask anything ("What did Alex say about
+  me?") under the summary: the answer cites the times it comes from, is
+  saved with the meeting (and in `summary.md`), and can be copied, edited
+  and asked again, or deleted. "Me" means your own speaker; suggestions
+  come from the speakers' names.
+- **Read aloud** for the summary and every answer, through the built-in
+  voice (as the link summary).
+
 ## [0.3.1] - 2026-10-15
 
 The first release with meetings (0.3.0 was tagged but never published).

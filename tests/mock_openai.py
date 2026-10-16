@@ -19,6 +19,15 @@ class H(BaseHTTPRequestHandler):
             answer = "\n".join("[%s] %s" % (m.group(1), m.group(2).upper()) for m in re.finditer(r"^\[(\d+)\] [^:]*: (.*)$", text, re.M))
         elif "name meeting recordings" in system:
             answer = "Mock meeting"
+        elif "for someone with a request about the meeting" in system:
+            answer = "- notes for the request"
+        elif "You answer a request about a meeting" in system:
+            question = text.split("Request: ", 1)[1].split("\n", 1)[0] if "Request: " in text else "?"
+            answer = "**Answer** to: " + question
+        elif "take notes on one part" in system:
+            answer = "- notes on " + text.split("\n", 1)[0]
+        elif "You summarize meetings" in system:
+            answer = "```markdown\n## Overview\nMock summary of %d characters.\n```" % len(text)
         elif "LEAK" in text and not think: answer = "The user wants me to fix this. <think>x</think>"
         else: answer = "OK: " + text.upper() + (" (thinking)" if think else "")
         if req.get("stream"):

@@ -92,6 +92,8 @@ pub const Meetings = struct {
     mic: bool = true,
     /// Proofread the transcript with the active profile when saving.
     proofread: bool = true,
+    /// Summarize it too when saving (else from the Meetings window).
+    summary: bool = false,
     /// Tell the others apart by voice when saving (a speaker model, downloaded
     /// on first use), and name the known voices.
     speakers: bool = true,

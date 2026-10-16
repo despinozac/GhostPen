@@ -769,6 +769,10 @@ export default function Settings() {
           Proofread the transcript with the AI profile when saving <span className="muted">(a clean text next to the transcript)</span>
         </label>
         <label className="checkbox">
+          <input type="checkbox" checked={meetingsCfg.summary ?? false} onChange={(e) => updateMeetings({ summary: e.target.checked })} />
+          Summarize it too <span className="muted">(else the meeting's Summary tab does it when you ask)</span>
+        </label>
+        <label className="checkbox">
           <input type="checkbox" checked={meetingsCfg.speakers ?? true} onChange={(e) => updateMeetings({ speakers: e.target.checked })} />
           Tell the speakers apart by voice <span className="muted">(a speaker model, 26 MB, downloaded the first time)</span>
         </label>

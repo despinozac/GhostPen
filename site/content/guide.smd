@@ -120,6 +120,12 @@ them by themselves. **Copy** gives the clean text, Markdown or subtitles;
 **Redo** proofreads or finds the speakers again; right-click a meeting to
 rename or delete it.
 
+The **Summary** tab writes an overview, key points, decisions and action
+items with your AI profile (a long meeting is read in parts first), and
+under it you can ask your own questions, such as *What did Alex say about
+me?* Answers cite the times they come from and are saved with the
+meeting; **🔊 Read** reads the summary or an answer aloud.
+
 Use a headset if you can: through speakers the microphone hears the call
 too. GhostPen drops those lines (same words, same moment), but a headset
 keeps your track clean. The speaker model (WeSpeaker, 26 MB) downloads the

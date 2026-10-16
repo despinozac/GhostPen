@@ -91,7 +91,11 @@ being said is highlighted, click a line to play from it, rename speakers
 (every line follows), merge them, move a line to another speaker, edit the
 text, copy it as text, Markdown or subtitles, or proofread and find the
 speakers again. Name a speaker and pick **Remember this voice**: later
-meetings name them by themselves, live in the captions too.
+meetings name them by themselves, live in the captions too. The
+**Summary** tab summarizes the meeting (overview, decisions, action
+items; long meetings in parts) and answers your own questions about it
+("What did Alex say about me?"), each saved with the meeting and read
+aloud on request.
 
 Through speakers instead of a headset the microphone hears the call: those
 lines are recognized as the others' (same words, same moment) and dropped.

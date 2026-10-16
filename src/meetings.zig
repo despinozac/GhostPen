@@ -270,9 +270,10 @@ fn isActive(id: []const u8) bool {
 
 // ---- the save pipeline -----------------------------------------------------------------------
 
-pub const Step = enum { all, transcribe, speakers, proofread };
+pub const Step = enum { all, transcribe, speakers, proofread, summary, ask };
 
-const Job = struct { root: []u8, id: []u8, step: Step };
+/// `prompt` and `note` (the answer to replace, "" = a new one) for `.ask`.
+const Job = struct { root: []u8, id: []u8, step: Step, prompt: []u8 = &.{}, note: []u8 = &.{} };
 
 var queue_mutex: std.Io.Mutex = .init;
 var queue: std.ArrayList(Job) = .empty;
@@ -281,13 +282,20 @@ var worker_running = false;
 var working_on: ?[]u8 = null;
 
 fn enqueue(root: []const u8, id: []const u8, step: Step) void {
+    enqueueJob(root, id, step, "", "");
+}
+
+fn enqueueJob(root: []const u8, id: []const u8, step: Step, prompt: []const u8, note: []const u8) void {
     queue_mutex.lockUncancelable(main.io);
     defer queue_mutex.unlock(main.io);
-    for (queue.items) |j| if (std.mem.eql(u8, j.id, id) and std.mem.eql(u8, j.root, root)) return;
+    // The same step for the same meeting queued twice is once; questions all go.
+    if (step != .ask) for (queue.items) |j| if (std.mem.eql(u8, j.id, id) and std.mem.eql(u8, j.root, root) and j.step == step) return;
     const job: Job = .{
         .root = gpa.dupe(u8, root) catch return,
         .id = gpa.dupe(u8, id) catch return,
         .step = step,
+        .prompt = gpa.dupe(u8, prompt) catch return,
+        .note = gpa.dupe(u8, note) catch return,
     };
     queue.append(gpa, job) catch return;
     if (worker_running) return;
@@ -319,13 +327,15 @@ fn workerMain() void {
         working_on = job.id;
         queue_mutex.unlock(main.io);
 
-        run(job.root, job.id, job.step);
+        run(job);
 
         queue_mutex.lockUncancelable(main.io);
         working_on = null;
         queue_mutex.unlock(main.io);
         gpa.free(job.root);
         gpa.free(job.id);
+        gpa.free(job.prompt);
+        gpa.free(job.note);
     }
 }
 
@@ -340,14 +350,17 @@ fn setState(arena: std.mem.Allocator, root: []const u8, id: []const u8, m: *Meet
     emitState(id, state, progress, m.message);
 }
 
-fn run(root: []const u8, id: []const u8, step: Step) void {
+fn run(job: Job) void {
+    const root = job.root;
+    const id = job.id;
+    const step = job.step;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var m = store.load(main.io, arena, root, id) catch |err| return log.warn("meeting {s}: {s}", .{ id, @errorName(err) });
     m.message = "";
     const began = std.Io.Clock.awake.now(main.io);
-    runSteps(arena, root, id, &m, step) catch |err| {
+    runSteps(arena, root, id, &m, job) catch |err| {
         const msg = if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err);
         log.warn("meeting {s}: {s}", .{ id, msg });
         m.message = arena.dupe(u8, msg) catch "";
@@ -356,6 +369,8 @@ fn run(root: []const u8, id: []const u8, step: Step) void {
         return;
     };
     setState(arena, root, id, &m, "ready", 1);
+    // Tests (tests/e2e-meetings.sh): a question asked once the meeting is saved.
+    if (step == .all) if (main.environ_map.get("GHOSTPEN_TEST_ASK")) |q| enqueueJob(root, id, .ask, q, "");
     if (step == .all) {
         var dur: [16]u8 = undefined;
         const body = std.fmt.allocPrint(arena, "{s} · {s}{s}{s}", .{
@@ -369,8 +384,22 @@ fn run(root: []const u8, id: []const u8, step: Step) void {
     log.info("meeting {s}: {s} done in {d} s", .{ id, @tagName(step), began.durationTo(std.Io.Clock.awake.now(main.io)).toSeconds() });
 }
 
-fn runSteps(arena: std.mem.Allocator, root: []const u8, id: []const u8, m: *Meeting, step: Step) !void {
+fn runSteps(arena: std.mem.Allocator, root: []const u8, id: []const u8, m: *Meeting, job: Job) !void {
+    const step = job.step;
     const s = try main.shared.get(main.io, arena);
+    if (step == .ask) {
+        if (m.segments.len == 0) return oriel.ipc.fail("Nothing to ask about: the meeting has no transcript.", .{});
+        setState(arena, root, id, m, "asking", 0);
+        const answer = try askMeeting(arena, id, m.*, s, job.prompt);
+        m.notes = try withNote(arena, m.notes, job.note, job.prompt, answer);
+        return;
+    }
+    if (step == .summary) {
+        if (m.segments.len == 0) return oriel.ipc.fail("Nothing to summarize: the meeting has no transcript.", .{});
+        setState(arena, root, id, m, "summarizing", 0);
+        m.summary = try summarize(arena, id, m.*, s);
+        return;
+    }
     if (step == .all) {
         setState(arena, root, id, m, "saving", 0);
         try mergeTracks(arena, root, id, m);
@@ -409,6 +438,13 @@ fn runSteps(arena: std.mem.Allocator, root: []const u8, id: []const u8, m: *Meet
             const why = if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err);
             m.message = try std.fmt.allocPrint(arena, "The proofread failed ({s}): run it again from the meeting's menu.", .{why});
         };
+    }
+    if (step == .all and s.meetings.summary and m.segments.len > 0) {
+        setState(arena, root, id, m, "summarizing", 0);
+        if (summarize(arena, id, m.*, s)) |sum| m.summary = sum else |err| {
+            const why = if (err == error.CommandFailed) oriel.ipc.errorText(err) else @errorName(err);
+            m.message = try std.fmt.allocPrint(arena, "The summary failed ({s}): summarize it again from the meeting's Summary tab.", .{why});
+        }
     }
 }
 
@@ -699,6 +735,111 @@ fn keptName(m: Meeting, id: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Input characters per summary request: the summary needs the context
+/// more than the proofread does (it reads much more than it writes).
+fn summaryBudget(s: main.Settings) usize {
+    const p = s.activeProfile();
+    if (!p.isLocal()) return 6000; // unknown context (Ollama's default is small)
+    const ctx: usize = s.localLlm.ctxTokens;
+    // ~3.5 characters a token, less the prompt and a ~700-token answer.
+    return std.math.clamp((ctx -| 1500) * 3, 2000, 20_000);
+}
+
+/// The meeting's summary (Markdown). A meeting too long for one request is
+/// taken in parts: notes on each, then the summary of the notes (notes
+/// that still don't fit are condensed again, a few rounds at most).
+fn summarize(arena: std.mem.Allocator, id: []const u8, m: Meeting, s: main.Settings) ![]const u8 {
+    const budget = summaryBudget(s);
+    const parts = try store.summaryParts(arena, m, budget);
+    if (parts.len == 1) return ask(arena, s, store.summary_system, parts[0]);
+    // Progress: one step per part, plus the final request.
+    const total: f64 = @floatFromInt(parts.len + 1);
+    var notes: std.ArrayList([]const u8) = .empty;
+    for (parts, 0..) |part, i| {
+        const prompt = try std.fmt.allocPrint(arena, "Part {d} of {d} of the meeting:\n\n{s}", .{ i + 1, parts.len, part });
+        try notes.append(arena, try ask(arena, s, store.summary_part_system, prompt));
+        emitState(id, "summarizing", @as(f64, @floatFromInt(i + 1)) / total, "");
+    }
+    var current = notes.items;
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        const groups = try store.groupNotes(arena, current, budget);
+        if (groups.len == 1) return ask(arena, s, store.summary_system, try std.fmt.allocPrint(arena, "Notes on the meeting's parts, in order:\n\n{s}", .{groups[0]}));
+        var next: std.ArrayList([]const u8) = .empty;
+        for (groups) |g| try next.append(arena, try ask(arena, s, store.summary_part_system, g));
+        current = next.items;
+    }
+    // Still too long after four rounds: the summary of the first group's worth.
+    const groups = try store.groupNotes(arena, current, budget);
+    return ask(arena, s, store.summary_system, groups[0]);
+}
+
+/// The user's question over the meeting: the answer at once when the
+/// meeting fits one request, else notes on what each part has on it
+/// (parts with nothing are skipped), then the answer from the notes.
+fn askMeeting(arena: std.mem.Allocator, id: []const u8, m: Meeting, s: main.Settings, prompt: []const u8) ![]const u8 {
+    const budget = summaryBudget(s);
+    const parts = try store.summaryParts(arena, m, budget);
+    if (parts.len == 1) return ask(arena, s, store.ask_system, try store.askPrompt(arena, m, prompt, parts[0]));
+    const total: f64 = @floatFromInt(parts.len + 1);
+    var notes: std.ArrayList([]const u8) = .empty;
+    for (parts, 0..) |part, i| {
+        const body = try std.fmt.allocPrint(arena, "Part {d} of {d} of the meeting:\n\n{s}", .{ i + 1, parts.len, part });
+        const n = try ask(arena, s, store.ask_part_system, try store.askPrompt(arena, m, prompt, body));
+        if (!store.isNone(n)) try notes.append(arena, n);
+        emitState(id, "asking", @as(f64, @floatFromInt(i + 1)) / total, "");
+    }
+    if (notes.items.len == 0) return ask(arena, s, store.ask_system, try store.askPrompt(arena, m, prompt, "(No part of the meeting had anything on this request.)"));
+    var current = notes.items;
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        const groups = try store.groupNotes(arena, current, budget);
+        if (groups.len == 1) break;
+        var next: std.ArrayList([]const u8) = .empty;
+        for (groups) |g| {
+            const n = try ask(arena, s, store.ask_part_system, try store.askPrompt(arena, m, prompt, g));
+            if (!store.isNone(n)) try next.append(arena, n);
+        }
+        current = next.items;
+    }
+    const groups = try store.groupNotes(arena, current, budget);
+    const body = try std.fmt.allocPrint(arena, "Notes on the meeting's parts, in order:\n\n{s}", .{if (groups.len > 0) groups[0] else "(none)"});
+    return ask(arena, s, store.ask_system, try store.askPrompt(arena, m, prompt, body));
+}
+
+/// The notes with this answer: replacing note `replace` (asked again), else
+/// a new note at the end.
+fn withNote(arena: std.mem.Allocator, notes: []const store.Note, replace: []const u8, prompt: []const u8, answer: []const u8) ![]const store.Note {
+    const now = std.Io.Clock.real.now(main.io).toMilliseconds();
+    var out: std.ArrayList(store.Note) = .empty;
+    var replaced = false;
+    var max: usize = 0;
+    for (notes) |n| {
+        if (n.id.len > 1 and n.id[0] == 'n') max = @max(max, std.fmt.parseInt(usize, n.id[1..], 10) catch 0);
+        if (replace.len > 0 and std.mem.eql(u8, n.id, replace)) {
+            try out.append(arena, .{ .id = n.id, .prompt = prompt, .answer = answer, .askedAt = now });
+            replaced = true;
+        } else try out.append(arena, n);
+    }
+    if (!replaced) try out.append(arena, .{ .id = try std.fmt.allocPrint(arena, "n{d}", .{max + 1}), .prompt = prompt, .answer = answer, .askedAt = now });
+    return out.items;
+}
+
+/// One request to the active profile; the answer trimmed, a ```markdown
+/// fence the model wrapped it in taken off.
+fn ask(arena: std.mem.Allocator, s: main.Settings, system: []const u8, user: []const u8) ![]const u8 {
+    var diag: ai.Diag = .{};
+    const answer = ai.complete(main.io, gpa, arena, .{ .profile = s.activeProfile(), .system = system, .user = .{ .text = user } }, &diag) catch |err|
+        return if (err == error.AiFailed) oriel.ipc.fail("{s}", .{diag.message}) else err;
+    var t = std.mem.trim(u8, answer, " \t\r\n");
+    if (std.mem.startsWith(u8, t, "```")) {
+        if (std.mem.indexOfScalar(u8, t, '\n')) |nl| t = t[nl + 1 ..];
+        if (std.mem.endsWith(u8, t, "```")) t = t[0 .. t.len - 3];
+        t = std.mem.trim(u8, t, " \t\r\n");
+    }
+    return t;
+}
+
 /// Input characters per proofread request: what fits the model's context
 /// with the answer (about as long) and the prompt.
 fn batchBudget(s: main.Settings) usize {
@@ -945,13 +1086,27 @@ pub const Commands = struct {
         log.info("meeting {s}: deleted", .{args.id});
     }
 
-    /// Run a step again: "transcribe" (and everything after), "speakers",
-    /// or "proofread".
+    /// Ask about the meeting: the answer is saved with it (a new note, or
+    /// `note`'s answer replaced). Progress as `ghostpen://meeting` "asking".
+    pub fn meetings_ask(arena: std.mem.Allocator, args: struct { id: []const u8, prompt: []const u8, note: []const u8 = "" }) !void {
+        const root = try rootDir(arena);
+        const m = try loadOrFail(arena, root, args.id);
+        if (std.mem.eql(u8, m.state, "recording")) return oriel.ipc.fail("Wait until the meeting is saved.", .{});
+        if (m.segments.len == 0) return oriel.ipc.fail("Nothing to ask about: the meeting has no transcript.", .{});
+        const prompt = std.mem.trim(u8, args.prompt, " \t\r\n");
+        if (prompt.len == 0) return oriel.ipc.fail("Write what you want to know.", .{});
+        if (prompt.len > 4000) return oriel.ipc.fail("That request is too long.", .{});
+        enqueueJob(root, args.id, .ask, prompt, args.note);
+    }
+
+    /// Run a step: "transcribe" (and everything after), "speakers",
+    /// "proofread", or "summary".
     pub fn meetings_reprocess(arena: std.mem.Allocator, args: struct { id: []const u8, step: []const u8 }) !void {
         const root = try rootDir(arena);
         const m = try loadOrFail(arena, root, args.id);
         if (!m.editable() or busyWith(args.id)) return oriel.ipc.fail("Wait until the meeting is saved.", .{});
         const step = std.meta.stringToEnum(Step, args.step) orelse return oriel.ipc.fail("Unknown step.", .{});
+        if (step == .ask) return oriel.ipc.fail("Ask with meetings_ask (it needs the question).", .{});
         enqueue(root, args.id, step);
     }
 
@@ -965,6 +1120,10 @@ pub const Commands = struct {
         if (eql(u8, f, "transcript")) return store.renderTranscript(arena, m, m.segments);
         if (eql(u8, f, "final")) return store.renderTranscript(arena, m, if (m.final.len > 0) m.final else m.segments);
         if (eql(u8, f, "srt")) return store.renderSrt(arena, m, m.segments);
+        if (eql(u8, f, "summary")) {
+            if (m.summary.len == 0) return oriel.ipc.fail("No summary yet: summarize the meeting first.", .{});
+            return std.fmt.allocPrint(arena, "# {s}\n\n{s}\n", .{ if (m.title.len > 0) m.title else "Meeting", m.summary });
+        }
         if (eql(u8, f, "text")) {
             var out: std.ArrayList(u8) = .empty;
             for (try store.turns(arena, if (m.final.len > 0) m.final else m.segments, std.math.maxInt(usize))) |t|

@@ -12,6 +12,7 @@ pub const others_track = "others.wav";
 pub const me_track = "me.wav";
 pub const transcript_name = "transcript.md";
 pub const final_name = "final.md";
+pub const summary_name = "summary.md";
 
 pub const me_id = "me";
 
@@ -36,6 +37,16 @@ pub const Segment = struct {
     /// The words and when each is said (the player highlights by them);
     /// empty in the clean text and for lines from older meetings.
     words: []const Word = &.{},
+};
+
+/// A question the user asked about the meeting, and the answer.
+pub const Note = struct {
+    id: []const u8,
+    prompt: []const u8,
+    /// Markdown ("" while it's being answered).
+    answer: []const u8 = "",
+    /// Milliseconds since the epoch.
+    askedAt: i64 = 0,
 };
 
 pub const Meeting = struct {
@@ -63,6 +74,10 @@ pub const Meeting = struct {
     segments: []const Segment = &.{},
     /// The proofread text, one entry per speaker turn.
     final: []const Segment = &.{},
+    /// The AI summary (Markdown; "" until asked for).
+    summary: []const u8 = "",
+    /// The user's own questions about the meeting, oldest first.
+    notes: []const Note = &.{},
 
     pub fn speakerName(m: Meeting, id: []const u8) []const u8 {
         for (m.speakers) |s| if (std.mem.eql(u8, s.id, id)) return s.name;
@@ -185,6 +200,7 @@ pub fn save(io: std.Io, arena: std.mem.Allocator, dir: []const u8, id: []const u
     try writeAtomic(io, arena, dir, id, json_name, body);
     if (m.segments.len > 0) try writeAtomic(io, arena, dir, id, transcript_name, try renderTranscript(arena, m, m.segments));
     if (m.final.len > 0) try writeAtomic(io, arena, dir, id, final_name, try renderTranscript(arena, m, m.final));
+    if (m.summary.len > 0 or m.notes.len > 0) try writeAtomic(io, arena, dir, id, summary_name, try renderSummary(arena, m));
 }
 
 fn writeAtomic(io: std.Io, arena: std.mem.Allocator, dir: []const u8, id: []const u8, name: []const u8, body: []const u8) !void {
@@ -423,12 +439,112 @@ pub fn cleanTitle(arena: std.mem.Allocator, answer: []const u8) ![]const u8 {
     return arena.dupe(u8, t);
 }
 
+// ---- summary --------------------------------------------------------------------------------
+
+pub const summary_part_system =
+    \\You take notes on one part of a meeting transcript (lines are "[time] Speaker: text").
+    \\Write concise notes, in the transcript's language, as Markdown bullets: what was discussed, decisions, action items (who will do what, and by when if said), open questions, and important numbers or names.
+    \\Use the speakers' names as given. Never invent anything that isn't in the text. Output only the bullets.
+;
+
+pub const summary_system =
+    \\You summarize meetings. You get either a meeting transcript (lines are "[time] Speaker: text") or notes on its parts, in order.
+    \\Write the summary in the meeting's language, in Markdown, with these sections (leave out a section with nothing in it):
+    \\## Overview (two or three sentences)
+    \\## Key points
+    \\## Decisions
+    \\## Action items (- **Who**: what, by when if said)
+    \\## Open questions
+    \\Use the speakers' names as given. Be concise and never invent anything that isn't in the input. Output only the summary.
+;
+
+pub const ask_part_system =
+    \\You read one part of a meeting transcript (lines are "[time] Speaker: text") for someone with a request about the meeting.
+    \\Write notes with only what in this part is relevant to the request: who said it, when ([time]), and short quotes where the wording matters.
+    \\If nothing in this part is relevant, answer exactly: NONE
+    \\Never invent anything that isn't in the text.
+;
+
+pub const ask_system =
+    \\You answer a request about a meeting, from its transcript (lines are "[time] Speaker: text") or from notes on its parts.
+    \\Answer in the language of the request, in Markdown, concisely; cite the times ([time]) where it helps to find the moment.
+    \\If the meeting doesn't contain what was asked, say so plainly. Never invent anything that isn't in the input.
+;
+
+/// The user message of a question: who "me" is, and the request.
+pub fn askPrompt(arena: std.mem.Allocator, m: Meeting, prompt: []const u8, body: []const u8) ![]const u8 {
+    var me: []const u8 = "";
+    for (m.speakers) |s| if (std.mem.eql(u8, s.id, me_id)) {
+        me = try std.fmt.allocPrint(arena, "The person asking is the speaker named \"{s}\": \"me\", \"I\" and \"my\" in the request mean them.\n", .{s.name});
+    };
+    return std.fmt.allocPrint(arena, "{s}Request: {s}\n\n{s}", .{ me, prompt, body });
+}
+
+/// An answer that says a part had nothing relevant.
+pub fn isNone(answer: []const u8) bool {
+    const t = std.mem.trim(u8, answer, " \t\r\n.*`\"");
+    return std.ascii.eqlIgnoreCase(t, "none");
+}
+
+/// summary.md: the summary, then the questions asked and their answers.
+pub fn renderSummary(arena: std.mem.Allocator, m: Meeting) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "# {s}\n\n_{s}_\n\n", .{ if (m.title.len > 0) m.title else "Meeting", m.startedLocal });
+    if (m.summary.len > 0) try out.print(arena, "{s}\n\n", .{m.summary});
+    if (m.notes.len > 0) {
+        try out.appendSlice(arena, "## Questions\n\n");
+        for (m.notes) |n| {
+            if (n.answer.len == 0) continue;
+            try out.print(arena, "### {s}\n\n{s}\n\n", .{ n.prompt, n.answer });
+        }
+    }
+    return out.items;
+}
+
+/// The meeting as "[mm:ss] Speaker: text" lines (the clean text when there
+/// is one), split into parts of at most `budget` characters, each starting
+/// on a turn.
+pub fn summaryParts(arena: std.mem.Allocator, m: Meeting, budget: usize) ![]const []const u8 {
+    const src = if (m.final.len > 0) m.final else m.segments;
+    const ts = try turns(arena, src, 1500);
+    var parts: std.ArrayList([]const u8) = .empty;
+    var cur: std.ArrayList(u8) = .empty;
+    for (ts) |t| {
+        var b: [16]u8 = undefined;
+        const line = try std.fmt.allocPrint(arena, "[{s}] {s}: {s}\n", .{ clock(&b, t.start), m.speakerName(t.speaker), t.text });
+        if (cur.items.len > 0 and cur.items.len + line.len > budget) {
+            try parts.append(arena, try cur.toOwnedSlice(arena));
+        }
+        try cur.appendSlice(arena, line);
+    }
+    if (cur.items.len > 0) try parts.append(arena, cur.items);
+    return parts.items;
+}
+
+/// Notes joined into groups of at most `budget` characters (for the next
+/// round when the notes on all the parts don't fit one request).
+pub fn groupNotes(arena: std.mem.Allocator, notes: []const []const u8, budget: usize) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var cur: std.ArrayList(u8) = .empty;
+    for (notes, 1..) |n, i| {
+        const block = try std.fmt.allocPrint(arena, "### Part {d}\n{s}\n\n", .{ i, std.mem.trim(u8, n, " \t\r\n") });
+        if (cur.items.len > 0 and cur.items.len + block.len > budget) try out.append(arena, try cur.toOwnedSlice(arena));
+        try cur.appendSlice(arena, block);
+    }
+    if (cur.items.len > 0) try out.append(arena, cur.items);
+    return out.items;
+}
+
 // ---- edits and audio windows ------------------------------------------------------------
 
 /// An edit from the page (not trusted): speakers unique and named, every
 /// line's speaker one of them, times finite and in order, sizes sane.
 pub fn check(m: Meeting) !void {
-    if (m.title.len > 200) return error.InvalidMeeting;
+    if (m.title.len > 200 or m.summary.len > 256 * 1024 or m.notes.len > 500) return error.InvalidMeeting;
+    for (m.notes, 0..) |n, i| {
+        if (n.id.len == 0 or n.id.len > 32 or n.prompt.len == 0 or n.prompt.len > 4000 or n.answer.len > 256 * 1024) return error.InvalidMeeting;
+        for (m.notes[0..i]) |o| if (std.mem.eql(u8, o.id, n.id)) return error.InvalidMeeting;
+    }
     if (m.speakers.len > 64 or m.segments.len > 200_000 or m.final.len > 200_000) return error.InvalidMeeting;
     for (m.speakers, 0..) |sp, i| {
         if (sp.id.len == 0 or sp.id.len > 32 or sp.name.len == 0 or sp.name.len > 80) return error.InvalidMeeting;
@@ -699,4 +815,41 @@ test "echoScore and dropEcho" {
     try std.testing.expectEqual(@as(usize, 1), try dropEcho(a, &segs, 2));
     try std.testing.expectEqual(@as(usize, 2), segs.items.len);
     try std.testing.expectEqualStrings("Sounds good, let's do that.", segs.items[1].text);
+}
+
+test "summaryParts and groupNotes stay within the budget" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = try summaryParts(a, test_meeting, 10_000);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expect(std.mem.startsWith(u8, one[0], "[00:00:00] Ana: hello everyone let's start\n[00:00:05] Me: sure\n"));
+    const many = try summaryParts(a, test_meeting, 40);
+    try std.testing.expectEqual(@as(usize, 2), many.len);
+    // Each part fits, unless one line alone is longer than the budget.
+    for (many) |p| try std.testing.expect(p.len <= 40 or std.mem.count(u8, p, "\n") == 1);
+    const groups = try groupNotes(a, &.{ "- a", "- b", "- c" }, 30);
+    try std.testing.expect(groups.len >= 2);
+    try std.testing.expect(std.mem.startsWith(u8, groups[0], "### Part 1\n- a"));
+}
+
+test "askPrompt, isNone and renderSummary" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try askPrompt(a, test_meeting, "What did Ana say about me?", "[00:00:00] Ana: hi");
+    try std.testing.expect(std.mem.startsWith(u8, p, "The person asking is the speaker named \"Me\""));
+    try std.testing.expect(std.mem.endsWith(u8, p, "Request: What did Ana say about me?\n\n[00:00:00] Ana: hi"));
+    try std.testing.expect(isNone(" NONE.\n"));
+    try std.testing.expect(isNone("**None**"));
+    try std.testing.expect(!isNone("None of them agreed."));
+    var m = test_meeting;
+    m.summary = "## Overview\nx";
+    m.notes = &.{ .{ .id = "n1", .prompt = "Q?", .answer = "A." }, .{ .id = "n2", .prompt = "pending" } };
+    const md = try renderSummary(a, m);
+    try std.testing.expect(std.mem.indexOf(u8, md, "## Overview\nx\n\n## Questions\n\n### Q?\n\nA.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "pending") == null);
+    try check(m);
+    m.notes = &.{ .{ .id = "n1", .prompt = "a" }, .{ .id = "n1", .prompt = "b" } };
+    try std.testing.expectError(error.InvalidMeeting, check(m));
 }

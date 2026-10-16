@@ -627,6 +627,7 @@ pub const Commands = struct {
         "meetings_list",           "meetings_get",         "meetings_update",       "meetings_delete",
         "meetings_reprocess",      "meetings_export",      "meetings_open_folder",  "meetings_release_audio",
         "meetings_folder",         "meetings_voices",      "meetings_remember_voice", "meetings_forget_voice",
+        "meetings_ask",
     };
 
     pub fn get_settings(arena: std.mem.Allocator) !Settings {
@@ -1081,6 +1082,7 @@ pub const Commands = struct {
     pub const meetings_voices = meetings.Commands.meetings_voices;
     pub const meetings_remember_voice = meetings.Commands.meetings_remember_voice;
     pub const meetings_forget_voice = meetings.Commands.meetings_forget_voice;
+    pub const meetings_ask = meetings.Commands.meetings_ask;
 };
 
 /// The working selection; when the menu hasn't read one, the clipboard

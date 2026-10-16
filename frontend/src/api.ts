@@ -76,6 +76,8 @@ export interface MeetingsSettings {
   mic: boolean;
   /** Proofread the transcript with the active profile when saving. */
   proofread: boolean;
+  /** Summarize it too when saving (else from the Meetings window). */
+  summary?: boolean;
   /** Tell the others apart by voice when saving (speaker model downloaded on first use). */
   speakers?: boolean;
   /** The speaker model ("" = the default). */
@@ -533,7 +535,17 @@ export interface MeetingSegment {
   words?: MeetingWord[];
 }
 
-export type MeetingState = "recording" | "saving" | "transcribing" | "diarizing" | "proofreading" | "ready" | "error";
+export type MeetingState = "recording" | "saving" | "transcribing" | "diarizing" | "proofreading" | "summarizing" | "asking" | "ready" | "error";
+
+/** A question about the meeting and its answer. */
+export interface MeetingNote {
+  id: string;
+  prompt: string;
+  /** Markdown ("" while being answered). */
+  answer: string;
+  /** Milliseconds since the epoch. */
+  askedAt: number;
+}
 
 export interface Meeting {
   version: number;
@@ -553,6 +565,10 @@ export interface Meeting {
   segments: MeetingSegment[];
   /** The proofread text, one entry per speaker turn. */
   final: MeetingSegment[];
+  /** The AI summary (Markdown; "" until asked for). */
+  summary?: string;
+  /** The user's own questions and their answers, oldest first. */
+  notes?: MeetingNote[];
 }
 
 export interface MeetingSummary {
@@ -584,8 +600,8 @@ export interface MeetingProgress {
   message: string;
 }
 
-export type MeetingEdit = Partial<Pick<Meeting, "title" | "speakers" | "segments" | "final">>;
-export type MeetingExport = "transcript" | "final" | "srt" | "text";
+export type MeetingEdit = Partial<Pick<Meeting, "title" | "speakers" | "segments" | "final" | "notes">>;
+export type MeetingExport = "transcript" | "final" | "srt" | "text" | "summary";
 
 export const openMeetings = () => invoke<void>("open_meetings");
 export const meetingsList = (query = "") => invoke<MeetingSummary[]>("meetings_list", { query });
@@ -593,8 +609,10 @@ export const meetingsGet = (id: string) => invoke<MeetingDetail>("meetings_get",
 export const meetingsUpdate = (id: string, edit: MeetingEdit) => invoke<Meeting>("meetings_update", { id, ...edit });
 export const meetingsDelete = (id: string) => invoke<void>("meetings_delete", { id });
 /** Run a step again: "transcribe" (and what follows), "speakers" or "proofread". */
-export const meetingsReprocess = (id: string, step: "transcribe" | "speakers" | "proofread") =>
+export const meetingsReprocess = (id: string, step: "transcribe" | "speakers" | "proofread" | "summary") =>
   invoke<void>("meetings_reprocess", { id, step });
+/** Ask about a meeting; the answer is saved with it (`note`: replace that answer). */
+export const meetingsAsk = (id: string, prompt: string, note = "") => invoke<void>("meetings_ask", { id, prompt, note });
 export const meetingsExport = (id: string, format: MeetingExport) => invoke<string>("meetings_export", { id, format });
 /** Open a meeting's folder (or, without an id, the meetings folder) in the file manager. */
 export const meetingsOpenFolder = (id = "") => invoke<void>("meetings_open_folder", { id });

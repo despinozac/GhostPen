@@ -30,11 +30,11 @@ if [ -n "${SPEAKER_MODEL:-}" ]; then
 fi
 audio="${TEST_AUDIO:-$here/tests/speech.wav}"
 meetings="$tmp/Meetings"
-printf '{"settings":{"activeProfileId":"m","profiles":[{"id":"m","name":"Mock","baseUrl":"http://127.0.0.1:18766/v1","model":"mock","temperature":0.2}],"captions":{"model":"tiny","chunkSeconds":3},"meetings":{"enabled":true,"dir":"%s","proofread":true,"speakers":%s}}}' "$meetings" "$([ -n "${SPEAKER_MODEL:-}" ] && echo true || echo false)" \
+printf '{"settings":{"activeProfileId":"m","profiles":[{"id":"m","name":"Mock","baseUrl":"http://127.0.0.1:18766/v1","model":"mock","temperature":0.2}],"captions":{"model":"tiny","chunkSeconds":3},"meetings":{"enabled":true,"dir":"%s","proofread":true,"summary":true,"speakers":%s}}}' "$meetings" "$([ -n "${SPEAKER_MODEL:-}" ] && echo true || echo false)" \
   > "$XDG_CONFIG_HOME/dev.ghostpen.Oriel/settings.json"
 python3 "$here/tests/mock_openai.py" 18766 & mock=$!
 app="$here/zig-out/bin/ghostpen"
-GHOSTPEN_SPEAKERS_DUMP="$out/windows.json" GHOSTPEN_TEST_AUDIO="$audio" "$app" > "$tmp/app.log" 2>&1 & pid=$!
+GHOSTPEN_TEST_ASK="What did they say about me?" GHOSTPEN_SPEAKERS_DUMP="$out/windows.json" GHOSTPEN_TEST_AUDIO="$audio" "$app" > "$tmp/app.log" 2>&1 & pid=$!
 sleep 4
 fail=0
 check() { if eval "$2"; then echo "ok: $1"; else echo "FAIL: $1"; fail=1; fi; }
@@ -45,7 +45,9 @@ id=$(ls "$meetings" 2>/dev/null | head -1)
 check "a meeting folder while recording ($id)" '[ -n "$id" ] && [ -f "$meetings/$id/others.wav" ]'
 "$app" --captions   # stop → save
 for _ in $(seq 180); do
-  grep -q '"state": "ready"\|"state": "error"' "$meetings/$id/meeting.json" 2>/dev/null && break
+  # Saved, and the test question (GHOSTPEN_TEST_ASK) answered after it.
+  grep -q '"state": "ready"\|"state": "error"' "$meetings/$id/meeting.json" 2>/dev/null &&
+    grep -q '"prompt"\|"state": "error"' "$meetings/$id/meeting.json" && break
   sleep 1
 done
 json="$meetings/$id/meeting.json"
@@ -56,6 +58,8 @@ check "words timed inside their lines" 'python3 -c "import json,sys;m=json.load(
 check "clean text from the proofread" 'python3 -c "import json,sys;m=json.load(open(sys.argv[1]));t=m[\"final\"][0][\"text\"];sys.exit(0 if m[\"final\"] and t==t.upper() and not t.startswith(\"[\") else 1)" "$json"'
 check "the title came from the AI" 'grep -q "\"title\": \"Mock meeting\"" "$json"'
 check "a notification said it was saved" 'grep -q "Meeting saved" "$tmp/app.log"'
+check "the summary (fence taken off)" 'python3 -c "import json,sys;s=json.load(open(sys.argv[1]))[\"summary\"];sys.exit(0 if s.startswith(\"## Overview\") and \"\`\`\`\" not in s else 1)" "$json" && [ -s "$meetings/$id/summary.md" ]'
+check "a question asked about it, answered and saved" 'python3 -c "import json,sys;n=json.load(open(sys.argv[1]))[\"notes\"];sys.exit(0 if len(n)==1 and n[0][\"id\"]==\"n1\" and n[0][\"answer\"]==\"**Answer** to: What did they say about me?\" else 1)" "$json" && grep -q "## Questions" "$meetings/$id/summary.md"'
 check "transcript.md and final.md" '[ -s "$meetings/$id/transcript.md" ] && [ -s "$meetings/$id/final.md" ]'
 python3 -c "import json,sys;m=json.load(open(sys.argv[1]));print('  title:',m['title'],'| duration ms:',m['durationMs'],'| speakers:',[s['name'] for s in m['speakers']]);[print('  ',s['start'],s['speaker'],s['text']) for s in m['segments'][:3]];[print('  final:',s['text']) for s in m['final'][:2]]" "$json"
 

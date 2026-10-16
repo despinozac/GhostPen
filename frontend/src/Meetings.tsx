@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { listen } from "./events";
+import { renderMarkdown } from "./markdown";
 import {
   copyText,
   meetingsDelete,
@@ -9,6 +10,13 @@ import {
   meetingsOpenFolder,
   meetingsReleaseAudio,
   meetingsReprocess,
+  meetingsAsk,
+  listenVoice,
+  ttsSpeak,
+  ttsStop,
+  ttsWarmUp,
+  type TtsState,
+  type MeetingNote,
   meetingsUpdate,
   meetingsVoices,
   meetingsRememberVoice,
@@ -35,6 +43,8 @@ const STATE_LABEL: Record<string, string> = {
   transcribing: "Transcribing",
   diarizing: "Finding speakers",
   proofreading: "Proofreading",
+  summarizing: "Summarizing",
+  asking: "Answering",
   ready: "Ready",
   error: "Needs attention",
 };
@@ -166,7 +176,7 @@ export default function Meetings() {
   const [progress, setProgress] = useState<Record<string, MeetingProgress>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [tab, setTab] = useState<"transcript" | "final">("transcript");
+  const [tab, setTab] = useState<"transcript" | "final" | "summary">("transcript");
   const [find, setFind] = useState("");
   const [loadingList, setLoadingList] = useState(true);
 
@@ -191,6 +201,15 @@ export default function Meetings() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [menuOpen, setMenuOpen] = useState<"export" | "rerun" | null>(null);
   const [voicesOpen, setVoicesOpen] = useState(false);
+  // Questions about the meeting: the box, the answer it replaces (Edit), the ones in flight.
+  const [askDraft, setAskDraft] = useState("");
+  const [askReplace, setAskReplace] = useState<MeetingNote | null>(null);
+  const [asking, setAsking] = useState<{ prompt: string; note: string }[]>([]);
+  const [confirmNote, setConfirmNote] = useState<string | null>(null);
+  // Read aloud (the built-in voice, as the link summary's): what is being read.
+  const [voice, setVoice] = useState<TtsState>({ phase: "idle", message: "", progress: 0, voice: "" });
+  const [reading, setReading] = useState<string | null>(null);
+  const voiceBusy = voice.phase === "playing" || voice.phase === "generating" || voice.phase === "downloading";
   // The list's right-click menu: which meeting, where, and whether Delete was clicked once.
   const [ctxMenu, setCtxMenu] = useState<{ id: string; x: number; y: number; confirm: boolean } | null>(null);
   const [known, setKnown] = useState<KnownVoice[]>([]);
@@ -262,6 +281,7 @@ export default function Meetings() {
       });
       if (p.id === selectedRef.current && (p.state === "ready" || p.state === "error" || p.progress === 0)) {
         loadDetail(p.id);
+        if (p.state === "ready" || p.state === "error") setAsking([]);
       }
       if (p.state === "ready" || p.state === "error") refreshList();
     });
@@ -284,6 +304,44 @@ export default function Meetings() {
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [loadDetail, refreshList]);
+
+  useEffect(() => {
+    const un = listenVoice(setVoice);
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+  // The voice finished (or failed): nothing is being read.
+  useEffect(() => {
+    if (!voiceBusy) setReading(null);
+  }, [voiceBusy]);
+
+  /** Read `text` aloud as `key` ("summary" or a question's id); again stops it. */
+  const readAloud = (key: string, text: string) => {
+    if (reading === key && voiceBusy) {
+      ttsStop().catch(() => {});
+      setReading(null);
+      return;
+    }
+    if (voiceBusy) ttsStop().catch(() => {});
+    setReading(key);
+    // Times like [00:42:10] help on screen; read aloud they're just numbers.
+    ttsSpeak(text.replace(/\[\d{1,2}:\d{2}(?::\d{2})?\]\s*/g, "")).catch((e) => {
+      setReading(null);
+      setError(String(e));
+    });
+  };
+
+  const ReadButton = ({ id, text, className }: { id: string; text: string; className: string }) => (
+    <button
+      className={className}
+      title={reading === id && voiceBusy ? "Stop the built-in voice" : "Read it through the built-in voice"}
+      onMouseEnter={() => ttsWarmUp().catch(() => {})}
+      onClick={() => readAloud(id, text)}
+    >
+      {reading === id && voiceBusy ? (voice.phase === "downloading" ? `■ Downloading ${Math.round(voice.progress * 100)}%` : "■ Stop") : "🔊 Read"}
+    </button>
+  );
 
   const refreshVoices = () => meetingsVoices().then(setKnown).catch(() => {});
   useEffect(() => {
@@ -332,6 +390,7 @@ export default function Meetings() {
 
   const lines = useMemo<MeetingSegment[]>(() => {
     if (!meeting) return [];
+    if (tab === "summary") return [];
     return byStart(tab === "final" ? meeting.final : meeting.segments);
   }, [meeting, tab]);
 
@@ -500,7 +559,7 @@ export default function Meetings() {
     }
   };
 
-  const rerun = async (step: "transcribe" | "speakers" | "proofread") => {
+  const rerun = async (step: "transcribe" | "speakers" | "proofread" | "summary") => {
     if (!detail) return;
     setMenuOpen(null);
     try {
@@ -510,6 +569,35 @@ export default function Meetings() {
       setError(String(e));
     }
   };
+
+  const askAbout = async (prompt: string, note = "") => {
+    if (!detail || !prompt.trim()) return;
+    try {
+      await meetingsAsk(detail.id, prompt.trim(), note);
+      setAsking((a) => [...a, { prompt: prompt.trim(), note }]);
+      setAskDraft("");
+      setAskReplace(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const deleteNote = (id: string) => {
+    if (!meeting) return;
+    setConfirmNote(null);
+    save({ notes: (meeting.notes ?? []).filter((n) => n.id !== id) });
+  };
+
+  // Suggestions for an empty box, from the speakers' names.
+  const suggestions = useMemo(() => {
+    if (!meeting) return [];
+    const me = meeting.speakers.find((s) => s.id === "me");
+    const others = meeting.speakers.filter((s) => s.id !== "me" && !/^Speaker \d+$/.test(s.name));
+    const out = others.slice(0, 2).map((s) => (me ? `What did ${s.name} say about me?` : `What did ${s.name} say?`));
+    if (me) out.push("What do I have to do after this meeting?");
+    out.push("What was decided, in three bullets?");
+    return out;
+  }, [meeting]);
 
   const removeId = async (id: string) => {
     try {
@@ -743,6 +831,7 @@ export default function Meetings() {
                   </button>
                   {menuOpen === "export" && (
                     <div className="mt-menu">
+                      <button disabled={!meeting.summary} onClick={() => doExport("summary", "Summary")}>Summary</button>
                       <button onClick={() => doExport("text", "Clean text")}>Clean text</button>
                       <button onClick={() => doExport("final", "Markdown (clean)")}>Markdown, clean</button>
                       <button onClick={() => doExport("transcript", "Markdown transcript")}>Markdown, transcript with times</button>
@@ -756,6 +845,7 @@ export default function Meetings() {
                   </button>
                   {menuOpen === "rerun" && (
                     <div className="mt-menu">
+                      <button onClick={() => rerun("summary")}>{meeting.summary ? "Summarize again" : "Summarize"}</button>
                       <button onClick={() => rerun("proofread")}>Proofread again</button>
                       <button onClick={() => rerun("speakers")}>Find the speakers again</button>
                       <button onClick={() => rerun("transcribe")} title="Your edits to the lines are replaced">
@@ -862,8 +952,11 @@ export default function Meetings() {
                 <button role="tab" aria-selected={tab === "final"} className={tab === "final" ? "active" : ""} onClick={() => setTab("final")}>
                   Clean text
                 </button>
+                <button role="tab" aria-selected={tab === "summary"} className={tab === "summary" ? "active" : ""} onClick={() => setTab("summary")}>
+                  Summary
+                </button>
               </div>
-              <div className="mt-find">
+              {tab !== "summary" && <div className="mt-find">
                 <input
                   id="mt-find"
                   type="search"
@@ -879,13 +972,119 @@ export default function Meetings() {
                   }}
                 />
                 {find.trim() && <span className="mt-find-count">{matches.length}</span>}
-              </div>
-              <label className="mt-follow" title="Scroll to the line being played">
-                <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow
-              </label>
+              </div>}
+              {tab !== "summary" && (
+                <label className="mt-follow" title="Scroll to the line being played">
+                  <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow
+                </label>
+              )}
+              {tab === "summary" && meeting.summary && (
+                <div className="mt-summary-actions">
+                  <ReadButton id="summary" text={meeting.summary} className="mt-btn" />
+                  <button className="mt-btn" onClick={() => doExport("summary", "Summary")}>Copy</button>
+                  <button className="mt-btn" disabled={!editable} onClick={() => rerun("summary")}>Summarize again</button>
+                </div>
+              )}
             </div>
 
+            {tab === "summary" && (
+              <div className="mt-summary">
+                {state === "summarizing" ? (
+                  <div className="mt-empty">
+                    Summarizing{liveState && liveState.progress > 0 ? ` (${Math.round(liveState.progress * 100)}%)` : ""}… A long meeting is read in parts, then
+                    summarized as a whole. You can close this window meanwhile.
+                  </div>
+                ) : meeting.summary ? (
+                  <article className="mt-summary-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(meeting.summary) }} />
+                ) : state === "asking" ? null : (
+                  <div className="mt-empty">
+                    <p>An overview, key points, decisions, action items and open questions, written by your AI profile.</p>
+                    <button className="mt-btn mt-summarize" disabled={!editable || !meeting.segments.length} onClick={() => rerun("summary")}>
+                      ✨ Summarize this meeting
+                    </button>
+                    {meeting.durationMs > 30 * 60 * 1000 && (
+                      <p className="mt-hint">A long meeting: it's read in parts, so this takes a few minutes.</p>
+                    )}
+                  </div>
+                )}
+
+                <section className="mt-ask">
+                  <h3>Ask about this meeting</h3>
+                  <form
+                    className="mt-ask-form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      askAbout(askDraft, askReplace?.id ?? "");
+                    }}
+                  >
+                    <textarea
+                      className="mt-ask-input"
+                      rows={2}
+                      value={askDraft}
+                      placeholder={suggestions[0] ? `e.g. ${suggestions[0]}` : "What did they say about…?"}
+                      disabled={!meeting.segments.length || meeting.state === "recording"}
+                      onChange={(e) => setAskDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          askAbout(askDraft, askReplace?.id ?? "");
+                        }
+                        if (e.key === "Escape" && askReplace) {
+                          setAskReplace(null);
+                          setAskDraft("");
+                        }
+                      }}
+                    />
+                    <button className="mt-btn mt-ask-go" type="submit" disabled={!askDraft.trim()}>
+                      {askReplace ? "Ask again" : "Ask"}
+                    </button>
+                  </form>
+                  {askReplace && <div className="mt-hint">Replaces the answer to “{askReplace.prompt}”. Esc to cancel.</div>}
+                  {!askDraft && !askReplace && suggestions.length > 0 && (
+                    <div className="mt-ask-suggest">
+                      {suggestions.map((q) => (
+                        <button key={q} className="mt-chip" onClick={() => setAskDraft(q)}>
+                          {q}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {asking.map((a, i) => (
+                    <article key={`pending-${i}`} className="mt-note pending">
+                      <div className="mt-note-q">{a.prompt}</div>
+                      <div className="mt-hint">
+                        <span className="spinner mt-note-spin" /> Reading the meeting
+                        {state === "asking" && liveState && liveState.progress > 0 ? ` (${Math.round(liveState.progress * 100)}%)` : ""}…
+                      </div>
+                    </article>
+                  ))}
+                  {[...(meeting.notes ?? [])].reverse().map((n) => (
+                    <article key={n.id} className="mt-note">
+                      <div className="mt-note-head">
+                        <div className="mt-note-q">{n.prompt}</div>
+                        <div className="mt-note-actions">
+                          <ReadButton id={n.id} text={`${n.prompt}\n\n${n.answer}`} className="mt-link" />
+                          <button className="mt-link" onClick={() => copyText(`## ${n.prompt}\n\n${n.answer}`).then(() => flash("Answer copied"))}>Copy</button>
+                          <button className="mt-link" onClick={() => { setAskReplace(n); setAskDraft(n.prompt); }}>Edit</button>
+                          <button className="mt-link" onClick={() => askAbout(n.prompt, n.id)}>Ask again</button>
+                          {confirmNote === n.id ? (
+                            <button className="mt-link danger" onClick={() => deleteNote(n.id)}>Delete for good</button>
+                          ) : (
+                            <button className="mt-link danger" disabled={!editable} onClick={() => setConfirmNote(n.id)}>Delete</button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="mt-note-meta">{n.askedAt ? new Date(n.askedAt).toLocaleString() : ""}</div>
+                      <div className="mt-summary-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(n.answer) }} />
+                    </article>
+                  ))}
+                </section>
+              </div>
+            )}
+
             <div
+              hidden={tab === "summary"}
               className="mt-lines"
               ref={linesRef}
               onWheel={() => (userScrolledAt.current = Date.now())}

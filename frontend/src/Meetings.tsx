@@ -441,7 +441,7 @@ export default function Meetings() {
   // Stereo recordings (the others left, you right) play as they are: a Web
   // Audio mono mix played silence in WebKitGTK (the media server's audio
   // came out of MediaElementSource as nothing).
-  const play = async () => {
+  const play = useCallback(async () => {
     const el = audioRef.current;
     if (!el) return;
     try {
@@ -449,18 +449,18 @@ export default function Meetings() {
     } catch (e) {
       setAudioError(`Can't play the recording (${e}).`);
     }
-  };
+  }, []);
 
-  const toggle = () => (playing ? audioRef.current?.pause() : play());
+  const toggle = useCallback(() => (audioRef.current?.paused ? play() : audioRef.current?.pause()), [play]);
 
-  const seek = (t: number, andPlay = false) => {
+  const seek = useCallback((t: number, andPlay = false) => {
     const el = audioRef.current;
     if (!el) return;
     el.currentTime = Math.max(0, Math.min(t, el.duration || t));
     setTime(el.currentTime);
     userScrolledAt.current = 0;
     if (andPlay && el.paused) play();
-  };
+  }, [play]);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.playbackRate = speed;
@@ -471,13 +471,35 @@ export default function Meetings() {
   useEffect(() => {
     if (!playing) return;
     let frame = 0;
+    let previous = "";
     const tick = () => {
-      if (audioRef.current) setTime(audioRef.current.currentTime);
+      const el = audioRef.current;
+      if (el) {
+        const t = el.currentTime;
+        const index = lineAt(lines, t);
+        const line = lines[index];
+        const words = line ? timedWords(line) : null;
+        let word = -1;
+        let highlighted = false;
+        if (words) {
+          for (let i = 0; i < words.length && words[i].start <= t; i++) word = i;
+          highlighted = word >= 0 && t <= words[word].end + 0.3;
+        } else if (line && line.end > line.start) {
+          const count = line.text.split(/(\s+)/).filter((w) => w.trim()).length;
+          word = Math.min(count - 1, Math.floor(((t - line.start) / (line.end - line.start)) * count));
+        }
+        // The slider steps by 0.1 s; words can change between those steps.
+        const position = `${Math.round(t * 10)}:${Math.floor(t)}:${index}:${word}:${highlighted}`;
+        if (position !== previous) {
+          previous = position;
+          setTime(t);
+        }
+      }
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [playing]);
+  }, [playing, lines]);
 
   // Keyboard: Space play/pause, ←/→ 5 s, J/L 10 s, Ctrl+F find.
   useEffect(() => {
@@ -506,7 +528,7 @@ export default function Meetings() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, [toggle, seek]);
 
   // ---- speakers ----
 
@@ -1194,9 +1216,9 @@ export default function Meetings() {
                   src={detail.audio}
                   preload="metadata"
                   onPlay={() => setPlaying(true)}
-                  onPause={() => setPlaying(false)}
-                  onEnded={() => setPlaying(false)}
-                  onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+                  onPause={(e) => { setPlaying(false); setTime(e.currentTarget.currentTime); }}
+                  onEnded={(e) => { setPlaying(false); setTime(e.currentTarget.currentTime); }}
+                  onTimeUpdate={(e) => { if (!playing) setTime(e.currentTarget.currentTime); }}
                   onLoadedMetadata={(e) => setLength(e.currentTarget.duration)}
                   onError={() => setAudioError("The recording can't be played (the file is missing, or the window can't reach it).")}
                 />
@@ -1204,10 +1226,10 @@ export default function Meetings() {
               <button className="mt-play" disabled={!detail.audio} onClick={toggle} title="Play/pause (Space)">
                 {playing ? "❚❚" : "▶"}
               </button>
-              <button className="mt-skip" disabled={!detail.audio} onClick={() => seek(time - 10)} title="Back 10 s (J)">
+              <button className="mt-skip" disabled={!detail.audio} onClick={() => seek((audioRef.current?.currentTime ?? time) - 10)} title="Back 10 s (J)">
                 ↺10
               </button>
-              <button className="mt-skip" disabled={!detail.audio} onClick={() => seek(time + 10)} title="Forward 10 s (L)">
+              <button className="mt-skip" disabled={!detail.audio} onClick={() => seek((audioRef.current?.currentTime ?? time) + 10)} title="Forward 10 s (L)">
                 10↻
               </button>
               <span className="mt-clock">{clock(time)}</span>

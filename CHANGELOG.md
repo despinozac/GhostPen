@@ -4,6 +4,27 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-16
+
+### Fixed
+
+- Malformed WAV chunk sizes and unsupported channel counts no longer overflow
+  or stall the meeting reader; invalid channel selections are rejected.
+- Meeting jobs release partial allocations and roll back if a worker cannot
+  start. Failed saves show an error and can be retried with Transcribe again;
+  questions and reprocessing report queue failures.
+- The local model helper releases its saved-plan parsing allocations,
+  threadpool, control-text list, token cache and command-line strings.
+- Transcription server startup releases its bind address on failure; audio
+  monitor selection stops at the first matching source.
+
+### Changed
+
+- Meeting playback updates the interface when the displayed position, clock,
+  line or word changes, and keeps a stable keyboard listener.
+- The dictation waveform stops requesting animation frames once it is flat,
+  and resumes when its phase changes.
+
 ## [0.3.3] - 2026-10-15
 
 ### Changed

@@ -174,7 +174,11 @@ pub const Recording = struct {
         m.state = "saving";
         store.save(main.io, arena, r.root, r.id, m) catch |err| log.warn("meeting {s}: {s}", .{ r.id, @errorName(err) });
         emitState(r.id, m.state, 0, "");
-        enqueue(r.root, r.id, .all);
+        enqueue(r.root, r.id, .all) catch |err| {
+            log.err("meeting {s}: can't queue save ({s})", .{ r.id, @errorName(err) });
+            m.message = "The meeting worker couldn't start. Choose Transcribe again to retry saving.";
+            setState(arena, r.root, r.id, &m, "error", 0);
+        };
     }
 };
 
@@ -273,7 +277,31 @@ fn isActive(id: []const u8) bool {
 pub const Step = enum { all, transcribe, speakers, proofread, summary, ask };
 
 /// `prompt` and `note` (the answer to replace, "" = a new one) for `.ask`.
-const Job = struct { root: []u8, id: []u8, step: Step, prompt: []u8 = &.{}, note: []u8 = &.{} };
+const Job = struct {
+    root: []u8,
+    id: []u8,
+    step: Step,
+    prompt: []u8 = &.{},
+    note: []u8 = &.{},
+
+    fn init(root: []const u8, id: []const u8, step: Step, prompt: []const u8, note: []const u8) !Job {
+        const owned_root = try gpa.dupe(u8, root);
+        errdefer gpa.free(owned_root);
+        const owned_id = try gpa.dupe(u8, id);
+        errdefer gpa.free(owned_id);
+        const owned_prompt = try gpa.dupe(u8, prompt);
+        errdefer gpa.free(owned_prompt);
+        const owned_note = try gpa.dupe(u8, note);
+        return .{ .root = owned_root, .id = owned_id, .step = step, .prompt = owned_prompt, .note = owned_note };
+    }
+
+    fn deinit(j: Job) void {
+        gpa.free(j.root);
+        gpa.free(j.id);
+        gpa.free(j.prompt);
+        gpa.free(j.note);
+    }
+};
 
 var queue_mutex: std.Io.Mutex = .init;
 var queue: std.ArrayList(Job) = .empty;
@@ -281,27 +309,23 @@ var worker_running = false;
 /// The meeting the worker is on (guarded by `queue_mutex`).
 var working_on: ?[]u8 = null;
 
-fn enqueue(root: []const u8, id: []const u8, step: Step) void {
-    enqueueJob(root, id, step, "", "");
+fn enqueue(root: []const u8, id: []const u8, step: Step) !void {
+    try enqueueJob(root, id, step, "", "");
 }
 
-fn enqueueJob(root: []const u8, id: []const u8, step: Step, prompt: []const u8, note: []const u8) void {
+fn enqueueJob(root: []const u8, id: []const u8, step: Step, prompt: []const u8, note: []const u8) !void {
     queue_mutex.lockUncancelable(main.io);
     defer queue_mutex.unlock(main.io);
     // The same step for the same meeting queued twice is once; questions all go.
     if (step != .ask) for (queue.items) |j| if (std.mem.eql(u8, j.id, id) and std.mem.eql(u8, j.root, root) and j.step == step) return;
-    const job: Job = .{
-        .root = gpa.dupe(u8, root) catch return,
-        .id = gpa.dupe(u8, id) catch return,
-        .step = step,
-        .prompt = gpa.dupe(u8, prompt) catch return,
-        .note = gpa.dupe(u8, note) catch return,
-    };
-    queue.append(gpa, job) catch return;
+    const job = try Job.init(root, id, step, prompt, note);
+    errdefer job.deinit();
+    try queue.append(gpa, job);
     if (worker_running) return;
     const t = std.Thread.spawn(.{}, workerMain, .{}) catch |err| {
+        _ = queue.pop().?;
         log.err("meetings: no worker thread ({s})", .{@errorName(err)});
-        return;
+        return err;
     };
     t.detach();
     worker_running = true;
@@ -332,10 +356,7 @@ fn workerMain() void {
         queue_mutex.lockUncancelable(main.io);
         working_on = null;
         queue_mutex.unlock(main.io);
-        gpa.free(job.root);
-        gpa.free(job.id);
-        gpa.free(job.prompt);
-        gpa.free(job.note);
+        job.deinit();
     }
 }
 
@@ -370,7 +391,9 @@ fn run(job: Job) void {
     };
     setState(arena, root, id, &m, "ready", 1);
     // Tests (tests/e2e-meetings.sh): a question asked once the meeting is saved.
-    if (step == .all) if (main.environ_map.get("GHOSTPEN_TEST_ASK")) |q| enqueueJob(root, id, .ask, q, "");
+    if (step == .all) if (main.environ_map.get("GHOSTPEN_TEST_ASK")) |q| {
+        enqueueJob(root, id, .ask, q, "") catch |err| log.warn("meeting {s}: can't queue question ({s})", .{ id, @errorName(err) });
+    };
     if (step == .all) {
         var dur: [16]u8 = undefined;
         const body = std.fmt.allocPrint(arena, "{s} · {s}{s}{s}", .{
@@ -400,7 +423,7 @@ fn runSteps(arena: std.mem.Allocator, root: []const u8, id: []const u8, m: *Meet
         m.summary = try summarize(arena, id, m.*, s);
         return;
     }
-    if (step == .all) {
+    if (step == .all or step == .transcribe) {
         setState(arena, root, id, m, "saving", 0);
         try mergeTracks(arena, root, id, m);
     }
@@ -931,7 +954,12 @@ fn resume_() void {
         if (std.mem.eql(u8, sum.state, "ready") or std.mem.eql(u8, sum.state, "error")) continue;
         if (isActive(sum.id)) continue;
         log.info("meeting {s}: unfinished ({s}), finishing it", .{ sum.id, sum.state });
-        enqueue(root, sum.id, .all);
+        enqueue(root, sum.id, .all) catch |err| {
+            log.err("meeting {s}: can't queue recovery ({s})", .{ sum.id, @errorName(err) });
+            var m = store.load(main.io, arena, root, sum.id) catch continue;
+            m.message = "The meeting worker couldn't start. Choose Transcribe again to retry saving.";
+            setState(arena, root, sum.id, &m, "error", 0);
+        };
     }
 }
 
@@ -1114,7 +1142,7 @@ pub const Commands = struct {
         const prompt = std.mem.trim(u8, args.prompt, " \t\r\n");
         if (prompt.len == 0) return oriel.ipc.fail("Write what you want to know.", .{});
         if (prompt.len > 4000) return oriel.ipc.fail("That request is too long.", .{});
-        enqueueJob(root, args.id, .ask, prompt, args.note);
+        enqueueJob(root, args.id, .ask, prompt, args.note) catch |err| return oriel.ipc.fail("Could not queue the question ({s}). Try again.", .{@errorName(err)});
     }
 
     /// Run a step: "transcribe" (and everything after), "speakers",
@@ -1125,7 +1153,7 @@ pub const Commands = struct {
         if (!m.editable() or busyWith(args.id)) return oriel.ipc.fail("Wait until the meeting is saved.", .{});
         const step = std.meta.stringToEnum(Step, args.step) orelse return oriel.ipc.fail("Unknown step.", .{});
         if (step == .ask) return oriel.ipc.fail("Ask with meetings_ask (it needs the question).", .{});
-        enqueue(root, args.id, step);
+        enqueue(root, args.id, step) catch |err| return oriel.ipc.fail("Could not queue the meeting ({s}). Try again.", .{@errorName(err)});
     }
 
     /// The meeting as text: "transcript" or "final" (Markdown), "srt",

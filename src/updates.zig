@@ -284,7 +284,7 @@ fn autoCheck() void {
 }
 
 /// A desktop notification, from the main thread.
-fn notify(comptime title_fmt: []const u8, body: []const u8, v: []const u8) void {
+fn notify(comptime title_fmt: []const u8, comptime body: []const u8, v: []const u8) void {
     // The title lives in the task's own copy of the context: nothing to
     // free, even when the task is dropped without running (shutdown).
     const Ctx = struct { buf: [128]u8, len: usize, body: []const u8 };

@@ -179,25 +179,41 @@ pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8
     out_writer = std.Io.File.stdout().writerStreaming(io, &out_buf);
 
     var opts: Options = .{ .model = "" };
+    var model_owned = false;
+    defer {
+        if (model_owned) gpa.free(opts.model);
+        if (opts.mmproj) |p| gpa.free(p);
+        if (opts.embed_model) |p| gpa.free(p);
+        if (plans_path) |p| gpa.free(p);
+        plans_path = null;
+    }
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         const has_value = i + 1 < args.len;
         if (std.mem.eql(u8, a, "--model") and has_value) {
             i += 1;
-            opts.model = gpa.dupeZ(u8, args[i]) catch return 1;
+            const value = gpa.dupeZ(u8, args[i]) catch return 1;
+            if (model_owned) gpa.free(opts.model);
+            opts.model = value;
+            model_owned = true;
         } else if (std.mem.eql(u8, a, "--plans") and has_value) {
             i += 1;
+            if (plans_path) |p| gpa.free(p);
             plans_path = gpa.dupeZ(u8, args[i]) catch null;
         } else if (std.mem.eql(u8, a, "--mmproj") and has_value) {
             i += 1;
-            opts.mmproj = gpa.dupeZ(u8, args[i]) catch return 1;
+            const value = gpa.dupeZ(u8, args[i]) catch return 1;
+            if (opts.mmproj) |p| gpa.free(p);
+            opts.mmproj = value;
         } else if (std.mem.eql(u8, a, "--ctx") and has_value) {
             i += 1;
             opts.ctx = std.fmt.parseInt(u32, args[i], 10) catch 8192;
         } else if (std.mem.eql(u8, a, "--embed-model") and has_value) {
             i += 1;
-            opts.embed_model = gpa.dupeZ(u8, args[i]) catch return 1;
+            const value = gpa.dupeZ(u8, args[i]) catch return 1;
+            if (opts.embed_model) |p| gpa.free(p);
+            opts.embed_model = value;
         } else if (std.mem.eql(u8, a, "--kv-type") and has_value) {
             i += 1;
             opts.kv_type = parseKvType(args[i]) orelse {
@@ -268,6 +284,11 @@ pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8
         const vocab = c.llama_model_get_vocab(m.model).?;
         break :blk .{ .gpa = gpa, .model = m.model, .ctx = m.ctx, .vocab = vocab, .format = m.format, .template = m.template, .vision = m.vision, .n_ubatch = m.n_ubatch, .specials = controlTexts(gpa, vocab, m.vision != null) };
     } else null;
+
+    defer if (engine) |*e| {
+        e.cached.deinit(gpa);
+        gpa.free(e.specials.texts);
+    };
 
     // Requests: the worker generates; this thread keeps reading so a cancel
     // gets through.
@@ -346,6 +367,7 @@ pub fn main(process_io: std.Io, gpa: std.mem.Allocator, args: []const []const u8
 const ChatModel = struct {
     model: *c.llama_model,
     ctx: *c.llama_context,
+    threadpool: c.ggml_threadpool_t,
     vision: ?*c.mtmd_context,
     ngl: i32,
     /// The prompt micro-batch the plan chose (the prefill loop feeds
@@ -469,7 +491,7 @@ const ChatModel = struct {
         const vision: ?*c.mtmd_context = if (opts.mmproj) |path| loadVision(path, model, ngl > 0, threads) else null;
 
         const template: ?[]const u8 = if (c.llama_model_chat_template(model, null)) |t| std.mem.span(t) else null;
-        return .{ .model = model, .ctx = ctx, .vision = vision, .ngl = ngl, .n_ubatch = batches.ubatch, .template = template, .format = chat_format.detect(template) };
+        return .{ .model = model, .ctx = ctx, .threadpool = tp, .vision = vision, .ngl = ngl, .n_ubatch = batches.ubatch, .template = template, .format = chat_format.detect(template) };
     }
 
     /// The vision projector: on the GPU with the model; without it (null,
@@ -525,6 +547,7 @@ const ChatModel = struct {
     fn deinit(self: *ChatModel) void {
         if (self.vision) |m| c.mtmd_free(m);
         c.llama_free(self.ctx);
+        if (self.threadpool) |tp| c.ggml_threadpool_free(tp);
         c.llama_model_free(self.model);
     }
 };
@@ -783,7 +806,9 @@ fn planRemembered(opts: Options, gpus: usize) ?Remembered {
     defer plan_gpa.free(data);
     var key_buf: [2048]u8 = undefined;
     const want = planKey(&key_buf, opts, gpus) orelse return null;
-    const parsed = std.json.parseFromSliceLeaky(PlanFile, plan_gpa, data, .{ .ignore_unknown_fields = true }) catch return null;
+    var arena: std.heap.ArenaAllocator = .init(plan_gpa);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(PlanFile, arena.allocator(), data, .{ .ignore_unknown_fields = true }) catch return null;
     for (parsed.plans) |e| {
         if (!std.mem.eql(u8, e.key, want)) continue;
         if (e.ngl <= 0 or e.experts > 0xffff) continue;
@@ -949,6 +974,7 @@ fn writeMoeOverrides(patterns: *[128][96]u8, overrides: *[129]c.llama_model_tens
 /// neutralized against them. Empty when out of memory (logged).
 fn controlTexts(gpa: std.mem.Allocator, vocab: *const c.llama_vocab, vision: bool) chat_format.Specials {
     var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(gpa);
     const n: usize = @intCast(@max(c.llama_vocab_n_tokens(vocab), 0));
     for (0..n) |i| {
         const tok: c.llama_token = @intCast(i);
@@ -958,7 +984,7 @@ fn controlTexts(gpa: std.mem.Allocator, vocab: *const c.llama_vocab, vision: boo
         texts.append(gpa, text) catch break;
     }
     if (vision) texts.append(gpa, std.mem.span(c.mtmd_default_marker())) catch {};
-    return .init(texts.items);
+    return .init(texts.toOwnedSlice(gpa) catch return .{});
 }
 
 const Engine = struct {

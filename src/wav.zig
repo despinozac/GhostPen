@@ -132,6 +132,7 @@ pub fn info(io: std.Io, file: std.Io.File) !Info {
             if (len < 16 or try file.readPositionalAll(io, &f, at + 8) != 16) return error.NotWav;
             if (std.mem.readInt(u16, f[0..2], .little) != 1 or std.mem.readInt(u16, f[14..16], .little) != 16) return error.UnsupportedFormat;
             channels = std.mem.readInt(u16, f[2..4], .little);
+            if (channels > 2) return error.UnsupportedFormat;
             rate = std.mem.readInt(u32, f[4..8], .little);
         } else if (std.mem.eql(u8, ch[0..4], "data")) {
             if (channels == 0 or rate == 0) return error.NotWav;
@@ -142,7 +143,7 @@ pub fn info(io: std.Io, file: std.Io.File) !Info {
             const n = if (len == 0) avail else data_len;
             return .{ .channels = channels, .rate = rate, .data_offset = at + 8, .data_len = n - n % block };
         }
-        at += 8 + len + (len & 1);
+        at += 8 + @as(u64, len) + (@as(u64, len) & 1);
     }
     return error.NotWav;
 }
@@ -160,13 +161,15 @@ pub fn repair(io: std.Io, path: []const u8) !void {
 /// Read one channel (0 = left/mono) of frames `[from, from + count)` as
 /// floats. Caller frees.
 pub fn readChannel(io: std.Io, gpa: std.mem.Allocator, file: std.Io.File, i: Info, channel: u16, from: u64, count: u64) ![]f32 {
+    if (i.channels == 0 or channel >= i.channels) return error.BadChannel;
+    const block: usize = @as(usize, i.channels) * 2;
+    var buf: [64 * 1024]u8 = undefined;
+    if (block > buf.len) return error.UnsupportedFormat;
     const total = i.frames();
     const start = @min(from, total);
     const n: usize = @intCast(@min(count, total - start));
     const out = try gpa.alloc(f32, n);
     errdefer gpa.free(out);
-    const block: usize = @as(usize, i.channels) * 2;
-    var buf: [64 * 1024]u8 = undefined;
     const per = buf.len / block;
     var done: usize = 0;
     while (done < n) {
@@ -287,4 +290,47 @@ test "repair: a header never patched reads as what the file holds" {
     var hb: [44]u8 = undefined;
     _ = try f.readPositionalAll(io, &hb, 0);
     try std.testing.expectEqual(@as(u32, 200), std.mem.readInt(u32, hb[40..44], .little));
+}
+
+test "info rejects an overflowing chunk length before data" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [52]u8 = undefined;
+    const h = header(1, 16000, 0);
+    @memcpy(data[0..36], h[0..36]);
+    @memcpy(data[36..40], "JUNK");
+    std.mem.writeInt(u32, data[40..44], 0xffffffff, .little);
+    @memcpy(data[44..52], h[36..44]);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.wav", .data = &data });
+    const f = try tmp.dir.openFile(io, "bad.wav", .{});
+    defer f.close(io);
+    try std.testing.expectError(error.NotWav, info(io, f));
+}
+
+test "info rejects more than two channels" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = header(3, 16000, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.wav", .data = &h });
+    const f = try tmp.dir.openFile(io, "bad.wav", .{});
+    defer f.close(io);
+    try std.testing.expectError(error.UnsupportedFormat, info(io, f));
+}
+
+test "readChannel rejects invalid channels and oversized frames" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = header(1, 16000, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "mono.wav", .data = &h });
+    const f = try tmp.dir.openFile(io, "mono.wav", .{});
+    defer f.close(io);
+    var i = try info(io, f);
+    try std.testing.expectError(error.BadChannel, readChannel(io, std.testing.allocator, f, i, 1, 0, 1));
+    i.channels = 0;
+    try std.testing.expectError(error.BadChannel, readChannel(io, std.testing.allocator, f, i, 0, 0, 1));
+    i.channels = 32769;
+    try std.testing.expectError(error.UnsupportedFormat, readChannel(io, std.testing.allocator, f, i, 0, 0, 1));
 }

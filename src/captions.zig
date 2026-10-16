@@ -365,14 +365,13 @@ fn defaultSinkMonitor(sources: []const audio.Source) !?[:0]u8 {
     defer gpa.free(run.stderr);
     const sink = std.mem.trim(u8, run.stdout, " \t\r\n");
     if (sink.len == 0 or std.ascii.eqlIgnoreCase(sink, "@DEFAULT_SINK@")) return null;
-    var found: ?[:0]u8 = null;
     for (sources) |src| {
         if (src.monitor and src.name.len == sink.len + ".monitor".len and
             std.mem.eql(u8, src.name[0..sink.len], sink) and std.mem.eql(u8, src.name[sink.len..], ".monitor"))
-            found = try gpa.dupeZ(u8, src.name);
+            return try gpa.dupeZ(u8, src.name);
     }
-    if (found == null) log.debug("no monitor source for the default sink {s}", .{sink});
-    return found;
+    log.debug("no monitor source for the default sink {s}", .{sink});
+    return null;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

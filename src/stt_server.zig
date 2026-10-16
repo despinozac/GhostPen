@@ -69,7 +69,7 @@ pub fn maybeStart(io: std.Io, env: *const std.process.Environ.Map) void {
     else blk: {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
-        const s = main.shared.get(io, arena.allocator()) catch break :blk "127.0.0.1:8771";
+        const s = main.shared.get(io, arena.allocator()) catch break :blk (gpa.dupe(u8, "127.0.0.1:8771") catch return);
         break :blk std.fmt.allocPrint(gpa, "{s}:{d}", .{ s.server.host, s.server.port }) catch return;
     };
     config = .{
@@ -77,12 +77,14 @@ pub fn maybeStart(io: std.Io, env: *const std.process.Environ.Map) void {
         .language = gpa.dupe(u8, env.get("GHOSTPEN_STT_LANGUAGE") orelse "auto") catch "auto",
     };
     const address = parseBind(bind) catch {
+        defer gpa.free(bind);
         log.warn("invalid GHOSTPEN_STT_BIND \"{s}\": not starting", .{bind});
         return;
     };
     bind_port = address.getPort();
     bind_loopback = isLoopback(address);
     const t = std.Thread.spawn(.{}, serve, .{ io, address, bind }) catch |err| {
+        gpa.free(bind);
         log.warn("can't start: {s}", .{@errorName(err)});
         return;
     };
@@ -118,6 +120,7 @@ fn currentModel(arena: std.mem.Allocator) []const u8 {
 }
 
 fn serve(io: std.Io, address: std.Io.net.IpAddress, bind: []const u8) void {
+    defer gpa.free(bind);
     // GHOSTPEN_STT_SERVER=1: load the model first so the first request isn't
     // slow; not downloaded: don't serve (every request would fail).
     if (preload) {

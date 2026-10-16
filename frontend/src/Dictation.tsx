@@ -145,12 +145,13 @@ export default function Dictation() {
       t += dt;
       const p = phaseRef.current;
       const listening = p === "listening";
-      raf = requestAnimationFrame(tick);
       if (p === "transcribing" || p === "proofreading") return; // shimmer drives the bars
       const target = listening ? levelTarget.current : 0;
       // Attack fast, release slow (like an audio meter): peaks pop, tails linger.
       const k = target > levelNow.current ? 0.3 : 0.07;
       levelNow.current += (target - levelNow.current) * k;
+      const flat = !listening && levelNow.current * AMP_GAIN * (BAR_MAX - BAR_MIN) < 0.05;
+      if (flat) levelNow.current = 0;
       const amp = Math.min(1, levelNow.current * AMP_GAIN);
       const idle = listening ? 0.05 : 0; // gentle breathing line when silent
       for (let i = 0; i < BAR_COUNT; i++) {
@@ -162,10 +163,11 @@ export default function Dictation() {
         const swell = Math.min(1, envelope(i) * (idle + amp) * flow * grain.current[i]);
         el.style.height = `${(BAR_MIN + (BAR_MAX - BAR_MIN) * Math.max(0, swell)).toFixed(1)}px`;
       }
+      if (!flat) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [phase]);
 
   // Transcript / state updates from the backend.
   useEffect(() => {

@@ -807,6 +807,21 @@ fn askMeeting(arena: std.mem.Allocator, id: []const u8, m: Meeting, s: main.Sett
     return ask(arena, s, store.ask_system, try store.askPrompt(arena, m, prompt, body));
 }
 
+/// The saved notes whose ids are in `kept` (the page's list after a
+/// Delete): it only removes answers, never adds or rewrites one.
+fn keptNotes(arena: std.mem.Allocator, saved: []const store.Note, kept: []const store.Note) ![]const store.Note {
+    var out: std.ArrayList(store.Note) = .empty;
+    for (saved) |n| {
+        for (kept) |k| {
+            if (std.mem.eql(u8, n.id, k.id)) {
+                try out.append(arena, n);
+                break;
+            }
+        }
+    }
+    return out.items;
+}
+
 /// The notes with this answer: replacing note `replace` (asked again), else
 /// a new note at the end.
 fn withNote(arena: std.mem.Allocator, notes: []const store.Note, replace: []const u8, prompt: []const u8, answer: []const u8) ![]const store.Note {
@@ -1051,13 +1066,15 @@ pub const Commands = struct {
     }
 
     /// The page's edits: title, speakers (names, merges), lines (text,
-    /// speaker), clean text. Only fields sent are changed.
+    /// speaker), clean text, and the answers kept (Delete on an answer).
+    /// Only fields sent are changed.
     pub fn meetings_update(arena: std.mem.Allocator, args: struct {
         id: []const u8,
         title: ?[]const u8 = null,
         speakers: ?[]const store.Speaker = null,
         segments: ?[]const store.Segment = null,
         final: ?[]const store.Segment = null,
+        notes: ?[]const store.Note = null,
     }) !Meeting {
         const root = try rootDir(arena);
         var m = try loadOrFail(arena, root, args.id);
@@ -1072,6 +1089,7 @@ pub const Commands = struct {
         if (args.speakers) |v| m.speakers = v;
         if (args.segments) |v| m.segments = v;
         if (args.final) |v| m.final = v;
+        if (args.notes) |v| m.notes = try keptNotes(arena, m.notes, v);
         store.check(m) catch return oriel.ipc.fail("That edit doesn't fit the meeting (unknown speaker or bad times).", .{});
         store.save(main.io, arena, root, args.id, m) catch |err| return oriel.ipc.fail("Could not save the meeting ({s}).", .{@errorName(err)});
         return m;
@@ -1221,4 +1239,15 @@ test fileUri {
     defer arena.deinit();
     if (builtin.os.tag != .windows)
         try std.testing.expectEqualStrings("file:///home/u/Docs%20x/M%C3%A9", try fileUri(arena.allocator(), "/home/u/Docs x/Mé"));
+}
+
+test keptNotes {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const saved = [_]store.Note{ .{ .id = "n1", .prompt = "p1", .answer = "a1" }, .{ .id = "n2", .prompt = "p2", .answer = "a2" } };
+    // Delete n1; a forged n3 and a rewritten n2 change nothing else.
+    const kept = try keptNotes(a, &saved, &.{ .{ .id = "n2", .prompt = "x", .answer = "forged" }, .{ .id = "n3", .prompt = "new" } });
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("a2", kept[0].answer);
 }

@@ -4,6 +4,21 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-15
+
+### Changed
+
+- Meeting question suggestions now cover action items, decisions, key
+  takeaways, unresolved questions and follow-up messages for every meeting,
+  with a generic question placeholder instead of speaker-specific examples.
+
+### Fixed
+
+- Deleting a saved meeting answer now removes it from the meeting.
+- The local installer opens Settings after restarting GhostPen, accepts
+  window arguments such as `--meetings`, and checks that the launched
+  process stays running before reporting success.
+
 ## [0.3.2] - 2026-10-15
 
 ### Added

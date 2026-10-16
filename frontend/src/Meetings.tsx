@@ -37,6 +37,15 @@ import {
 // clean (proofread) text, export and management. The Zig side owns the
 // files (src/meetings.zig); every edit goes through meetings_update.
 
+const MEETING_QUESTIONS = [
+  "What do I have to do after this meeting?",
+  "What was decided, in three bullets?",
+  "What were the key takeaways?",
+  "What action items, owners, and deadlines were agreed on?",
+  "What questions are still unresolved?",
+  "Draft a short follow-up message for this meeting.",
+];
+
 const STATE_LABEL: Record<string, string> = {
   recording: "Recording",
   saving: "Saving",
@@ -588,17 +597,6 @@ export default function Meetings() {
     save({ notes: (meeting.notes ?? []).filter((n) => n.id !== id) });
   };
 
-  // Suggestions for an empty box, from the speakers' names.
-  const suggestions = useMemo(() => {
-    if (!meeting) return [];
-    const me = meeting.speakers.find((s) => s.id === "me");
-    const others = meeting.speakers.filter((s) => s.id !== "me" && !/^Speaker \d+$/.test(s.name));
-    const out = others.slice(0, 2).map((s) => (me ? `What did ${s.name} say about me?` : `What did ${s.name} say?`));
-    if (me) out.push("What do I have to do after this meeting?");
-    out.push("What was decided, in three bullets?");
-    return out;
-  }, [meeting]);
-
   const removeId = async (id: string) => {
     try {
       if (id === detail?.id) audioRef.current?.pause();
@@ -1021,7 +1019,7 @@ export default function Meetings() {
                       className="mt-ask-input"
                       rows={2}
                       value={askDraft}
-                      placeholder={suggestions[0] ? `e.g. ${suggestions[0]}` : "What did they say about…?"}
+                      placeholder="Ask a question about this meeting…"
                       disabled={!meeting.segments.length || meeting.state === "recording"}
                       onChange={(e) => setAskDraft(e.target.value)}
                       onKeyDown={(e) => {
@@ -1040,9 +1038,9 @@ export default function Meetings() {
                     </button>
                   </form>
                   {askReplace && <div className="mt-hint">Replaces the answer to “{askReplace.prompt}”. Esc to cancel.</div>}
-                  {!askDraft && !askReplace && suggestions.length > 0 && (
+                  {!askDraft && !askReplace && (
                     <div className="mt-ask-suggest">
-                      {suggestions.map((q) => (
+                      {MEETING_QUESTIONS.map((q) => (
                         <button key={q} className="mt-chip" onClick={() => setAskDraft(q)}>
                           {q}
                         </button>

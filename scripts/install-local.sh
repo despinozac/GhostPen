@@ -5,6 +5,7 @@
 #   ~/.local/lib/ghostpen/ghostpen-cli    the CLI (~/.local/bin/ghostpen-cli links to it)
 #
 #   scripts/install-local.sh              build and install, restart GhostPen
+#   scripts/install-local.sh --meetings   restart with the Meetings window open
 #   NO_RESTART=1 scripts/install-local.sh leave GhostPen stopped
 #   CUDA_PREBUILT=/path/libggml-cuda.so   reuse this libggml-cuda.so (built by the
 #                                         same Oriel version) instead of the cache
@@ -86,6 +87,16 @@ echo "Installed GhostPen $version ($(du -h ~/.local/bin/ghostpen | cut -f1)) to 
 if [ -z "${NO_RESTART:-}" ]; then
   log="${XDG_STATE_HOME:-$HOME/.local/state}/ghostpen/ghostpen.log"
   mkdir -p "$(dirname "$log")"
-  setsid ~/.local/bin/ghostpen >>"$log" 2>&1 </dev/null &
+  # A plain launch only starts the tray. Open a window so the restart is
+  # visible, and detach from the invoking terminal before it exits.
+  [ "$#" -gt 0 ] || set -- --settings
+  nohup setsid ~/.local/bin/ghostpen "$@" >>"$log" 2>&1 </dev/null &
+  launch_pid=$!
+  sleep 2
+  if ! kill -0 "$launch_pid" 2>/dev/null; then
+    echo "error: GhostPen exited during startup (log: $log)" >&2
+    tail -n 20 "$log" >&2
+    exit 1
+  fi
   echo "Started GhostPen (log: $log)"
 fi

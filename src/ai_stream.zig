@@ -138,6 +138,15 @@ pub const Stream = struct {
 
 fn ignore(_: void, _: Delta) void {}
 
+test "live Summary formatting request matches the current production prompt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = struct { formatted_request: struct { system: []const u8 } };
+    const fixture = try std.json.parseFromSliceLeaky(Fixture, a, @embedFile("fixtures/summary-gemma4-e4b.json"), .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings(try @import("web_page.zig").summaryPrompt(a, .standard), fixture.formatted_request.system);
+}
+
 test "live E4B thinking-on output keeps thoughts separate through completion" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -171,8 +180,7 @@ test "live E4B thinking-on output keeps thoughts separate through completion" {
     try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "## Details") != null);
 }
 
-test "live E4B Summary fixture uses the production thinking-off prompt and initial channel" {
-    const web_page = @import("web_page.zig");
+test "original live E4B Summary fixture preserves the thinking-off output and initial channel" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -186,7 +194,6 @@ test "live E4B Summary fixture uses the production thinking-off prompt and initi
     try std.testing.expect(!fixture.request.think);
     try std.testing.expect(!fixture.producer.initial_thinking);
     try std.testing.expect(!fixture.completion.truncated and !fixture.completion.cancelled);
-    try std.testing.expectEqualStrings(try web_page.summaryPrompt(a, .standard), fixture.request.system);
     const prompt = (try chat_format.render(a, fixture.producer.format, fixture.request.system, fixture.request.user, fixture.request.think)).?;
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|turn>model\n"));
 

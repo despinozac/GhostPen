@@ -335,7 +335,7 @@ tests/e2e-audio.sh        # headless: captions overlay, dictation → proofread 
 ```
 
 The Summary regression fixture in `src/fixtures/summary-gemma4-e4b.json` records
-a live E4B run with the standard Summary prompt and `think=false`, including
+a live E4B run with the original standard Summary prompt and `think=false`, including
 the producer's actual initial channel. It also records the comparison run:
 the old empty-thought prefill produced `Thinking Process: … <channel|>Answer`,
 while the plain model-turn prompt produced only the summary. Both runs used
@@ -345,6 +345,13 @@ in the temporary build's Oriel dependency). A third captured run with
 `think=true` contains both channels; its regression checks that no thinking
 enters the answer before or after completion. This is evidence for that case,
 not a guarantee about arbitrary unmarked model prose.
+
+The fixture also keeps `formatted_request` and `formatted_output` for the
+clarified Summary prompt. E4B could copy the old bulleted instructions as
+`- ## Key points` and `- ## Details` when thinking was off. The instructions
+now distinguish section headings, prose, and list items. The live check
+requires actual heading lines and bullets; the component regression checks
+that Key points and Details render as sections in a newly generated summary.
 
 To repeat the live check with an already installed E4B model and your built
 GhostPen executable (no downloads or settings changes):

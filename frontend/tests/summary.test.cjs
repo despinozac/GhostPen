@@ -221,6 +221,31 @@ test('the switch requests thinking on the next run and can hide/reveal it after 
   await act(async () => resolveRun());
 });
 
+test('a new thinking-off summary renders the live Key points and Details as sections, not list text', async () => {
+  const fixture = require('../../src/fixtures/summary-gemma4-e4b.json');
+  const generated = fixture.formatted_output.chunks.join('');
+  await mount();
+  await click(screen.getByRole('button', { name: 'Summarize', exact: true }));
+  assert.equal(calls.find((c) => c.name === 'summarize_link').args.thinking, false);
+  await act(async () => {
+    emitStatus('writing');
+    for (const chunk of fixture.formatted_output.chunks) emitDelta('answer', chunk);
+    emitStatus('ready');
+    resolveRun();
+  });
+  await tick();
+  const article = paper();
+  assert.equal(article.firstElementChild.tagName, 'P', 'The introduction must not be a list item');
+  const headings = [...article.querySelectorAll(':scope > h2')];
+  assert.deepEqual(headings.map((h) => h.textContent), ['Key points', 'Details']);
+  assert.equal(headings[0].nextElementSibling.tagName, 'UL');
+  assert.ok(headings[0].nextElementSibling.children.length >= 3);
+  assert.equal(headings[1].nextElementSibling.tagName, 'P');
+  assert.ok(![...article.querySelectorAll('li')].some((li) => /^##\s/.test(li.textContent)));
+  await click(copy());
+  assert.equal(calls.find((c) => c.name === 'copy_text').args.text, generated.trim());
+});
+
 test('a model that returned no thinking despite the request is explained after reopening', async () => {
   localStorage.setItem('ghostpen-summary-reader', JSON.stringify({ showThinking: true }));
   snapshot = { ...empty, state: 'ready', thinking_requested: true, markdown: answer, revision: 1 };

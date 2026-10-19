@@ -8,7 +8,7 @@ This changelog follows the repository's release tags. There is no v0.2.1 tag.
 
 - The macOS tray icon is the GhostPen mark as a monochrome template image:
   the menu bar recolours it for light and dark mode itself, instead of a
-  coloured icon that reads as a blob (Oriel 0.18.0+'s `.template_png`).
+  coloured icon that reads as a blob (Oriel 0.18.1's `.template_png`).
 
 ## [0.3.4] - 2026-10-16
 

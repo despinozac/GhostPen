@@ -1140,6 +1140,11 @@ fn onHotkey(id: []const u8) void {
 
 var tray: ?*oriel.tray.Tray = null;
 
+/// The tray glyph as a monochrome template image for macOS: AppKit
+/// recolours it for the menu bar's theme itself (black on a light one,
+/// white on a dark one). A coloured icon reads as a blob there.
+const tray_mono_png = @embedFile("assets/tray-mono.png");
+
 fn onTrayMenu(id: []const u8, _: ?bool) void {
     const eql = std.mem.eql;
     if (eql(u8, id, "show")) {
@@ -1209,7 +1214,12 @@ fn setup() !void {
         .id = settings_mod.app_id,
         .title = "GhostPen",
         .tooltip = "GhostPen",
-        .icon = .{ .png = app.build.icon.? },
+        .icon = switch (builtin.os.tag) {
+            // macOS: a template image follows the menu bar's light/dark
+            // theme without any detection on our side.
+            .macos => .{ .template_png = tray_mono_png },
+            else => .{ .png = app.build.icon.? },
+        },
         .menu = &.{
             .{ .item = .{ .id = "show", .label = "Show menu" } },
             .{ .item = .{ .id = "dictate", .label = "Dictation" } },

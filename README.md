@@ -82,7 +82,7 @@ ghostpen-cli profiles
 ## Link summaries
 
 The Summary window keeps exposed model thinking separate from the summary.
-The **Show thinking** toolbar button reveals it while the answer streams or
+The **Show thinking** switch reveals it while the answer streams or
 after it finishes. Thinking is hidden by default, and the window remembers
 your choice. **Copy** and **Read summary** use only the summary, even when
 thinking is visible. This is a display preference; it does not enable
@@ -330,6 +330,24 @@ npm --prefix frontend test # Summary component: channels, toggle, Copy/TTS, snap
 zig build test            # AI client, settings, images, models
 tests/e2e.sh              # headless: select → trigger → Proofread → pasted; Playground streaming
 tests/e2e-audio.sh        # headless: captions overlay, dictation → proofread → clipboard
+```
+
+The Summary regression fixture in `src/fixtures/summary-gemma4-e4b.json` records
+a live E4B run with the standard Summary prompt and `think=false`, including
+the producer's actual initial channel. It also records the comparison run:
+the old empty-thought prefill produced `Thinking Process: … <channel|>Answer`,
+while the plain model-turn prompt produced only the summary. Both runs used
+the same synthetic article, seed 42, temperature 0.2, 4096-token context, and
+a CPU-only validation build of the same application sources (Metal disabled
+in the temporary build's Oriel dependency). This is evidence for that case,
+not a guarantee about arbitrary unmarked model prose.
+
+To repeat the live check with an already installed E4B model and your built
+GhostPen executable (no downloads or settings changes):
+
+```sh
+python3 tests/summary-live.py --exe zig-out/bin/ghostpen-dev \
+  --model "/path/to/gemma-4-E4B-it-Q4_K_M.gguf" --record /tmp/summary-live.jsonl
 ```
 
 The end-to-end tests run on a private X display (Xvfb + D-Bus) against a mock

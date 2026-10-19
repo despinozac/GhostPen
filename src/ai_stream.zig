@@ -138,6 +138,43 @@ pub const Stream = struct {
 
 fn ignore(_: void, _: Delta) void {}
 
+test "live E4B Summary fixture uses the production thinking-off prompt and initial channel" {
+    const web_page = @import("web_page.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = struct {
+        request: struct { system: []const u8, user: []const u8, think: bool },
+        producer: struct { format: chat_format.Format, initial_thinking: bool },
+        chunks: []const []const u8,
+        completion: struct { truncated: bool, cancelled: bool },
+    };
+    const fixture = try std.json.parseFromSliceLeaky(Fixture, a, @embedFile("fixtures/summary-gemma4-e4b.json"), .{ .ignore_unknown_fields = true });
+    try std.testing.expect(!fixture.request.think);
+    try std.testing.expect(!fixture.producer.initial_thinking);
+    try std.testing.expect(!fixture.completion.truncated and !fixture.completion.cancelled);
+    try std.testing.expectEqualStrings(try web_page.summaryPrompt(a, .standard), fixture.request.system);
+    const prompt = (try chat_format.render(a, fixture.producer.format, fixture.request.system, fixture.request.user, fixture.request.think)).?;
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|turn>model\n"));
+
+    // Actual helper deltas, not an invented implicit-thinking channel. The
+    // captured production combination is Gemma E4B + think=false.
+    var s = Stream.forPrompt(a, fixture.producer.format, fixture.request.think);
+    try std.testing.expectEqual(fixture.producer.initial_thinking, s.mode == .thought);
+    var raw: std.ArrayList(u8) = .empty;
+    for (fixture.chunks) |chunk| {
+        try raw.appendSlice(a, chunk);
+        try s.feed(chunk, {}, ignore);
+        try std.testing.expectEqualStrings(raw.items, s.answer.items);
+        try std.testing.expectEqualStrings("", s.thinking.items);
+    }
+    try s.finish({}, ignore);
+    try std.testing.expectEqualStrings(raw.items, s.answer.items);
+    try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "## Key points") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "## Details") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "<channel|>") == null);
+}
+
 test "implicit template channel: every prefix and cancellation keep reasoning out of the answer" {
     const raw = "Analyze the request. Private reasoning<channel|>## Summary\nAnswer.";
     const end = std.mem.indexOf(u8, raw, "<channel|>").? + "<channel|>".len;

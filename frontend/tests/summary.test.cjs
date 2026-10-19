@@ -103,7 +103,7 @@ function emitDelta(channel, text) {
 async function status(value) { act(() => emitStatus(value)); await tick(); }
 async function delta(channel, text) { act(() => emitDelta(channel, text)); await tick(); }
 async function click(element) { await act(async () => domFireEvent.click(element)); await tick(); }
-const toggle = () => screen.getByRole('button', { name: 'Show thinking' });
+const toggle = () => screen.getByRole('switch', { name: 'Show thinking' });
 const paper = () => document.querySelector('.summary-paper article');
 const copy = () => screen.getByRole('button', { name: /^(Copy|Copied)$/ });
 const read = () => screen.getByRole('button', { name: /Read summary/ });
@@ -126,22 +126,23 @@ test('heading-free thinking never appears in the summary or enables Copy/TTS, in
   assert.equal(calls.some((c) => ['copy_text', 'tts_speak'].includes(c.name)), false);
 });
 
-test('toolbar toggle is a focusable native pressed button, persists, and Reset restores hidden thinking', async () => {
+test('toolbar switch is a focusable native checkbox, persists, and Reset restores hidden thinking', async () => {
   snapshot = { ...empty, state: 'ready', markdown: answer, thinking: thoughts, revision: 4 };
   await mount();
-  assert.equal(toggle().type, 'button');
-  assert.equal(toggle().getAttribute('aria-pressed'), 'false');
+  assert.equal(toggle().type, 'checkbox');
+  assert.equal(toggle().checked, false);
   toggle().focus();
   assert.equal(document.activeElement, toggle());
-  await click(toggle());
-  assert.equal(toggle().getAttribute('aria-pressed'), 'true');
+  await click(screen.getByText('Show thinking'));
+  assert.equal(screen.getByRole('switch', { name: 'Show thinking', checked: true }), toggle());
+  assert.equal(toggle().checked, true);
   assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Analyze the request/);
   await unmount();
   await mount();
-  assert.equal(toggle().getAttribute('aria-pressed'), 'true');
+  assert.equal(toggle().checked, true);
   assert.equal(paper().textContent.includes(thoughts), false);
   await click(screen.getByRole('button', { name: 'Reset', hidden: true }));
-  assert.equal(toggle().getAttribute('aria-pressed'), 'false');
+  assert.equal(toggle().checked, false);
   assert.equal(screen.queryByRole('region', { name: 'Model thinking' }), null);
   assert.equal(JSON.parse(localStorage.getItem('ghostpen-summary-reader')).showThinking, false);
 });
@@ -224,12 +225,12 @@ test('old/corrupt settings default to hidden and thinking HTML stays inert', asy
   localStorage.setItem('ghostpen-summary-reader', '{broken');
   snapshot = { ...empty, state: 'ready', markdown: answer, thinking: '<img src=x onerror="alert(1)">', revision: 2 };
   await mount();
-  assert.equal(toggle().getAttribute('aria-pressed'), 'false');
+  assert.equal(toggle().checked, false);
   await click(toggle());
   assert.equal(screen.getByRole('region', { name: 'Model thinking' }).querySelector('img'), null);
   await unmount();
   localStorage.setItem('ghostpen-summary-reader', JSON.stringify({ size: 20, font: 'sans', spacing: 'compact' }));
   await mount();
-  assert.equal(toggle().getAttribute('aria-pressed'), 'false');
+  assert.equal(toggle().checked, false);
   assert.equal(screen.getByLabelText('Current font size').textContent, '20px');
 });

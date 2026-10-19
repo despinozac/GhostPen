@@ -329,14 +329,16 @@ export default function Summary() {
             <button className="summary-reader-reset" onClick={() => setReader(READER_DEFAULTS)}>Reset</button>
           </div>
         </details>
-        <button
-          type="button"
-          className="summary-reader-button summary-thinking-toggle"
-          aria-pressed={reader.showThinking}
-          onClick={() => setReader((r) => ({ ...r, showThinking: !r.showThinking }))}
-        >
-          Show thinking
-        </button>
+        <label className="summary-thinking-switch">
+          <input
+            type="checkbox"
+            role="switch"
+            checked={reader.showThinking}
+            onChange={(e) => setReader((r) => ({ ...r, showThinking: e.target.checked }))}
+          />
+          <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+          <span>Show thinking</span>
+        </label>
         <div className="summary-font-size" role="group" aria-label="Font size">
           <button aria-label="Decrease font size" disabled={reader.size <= 14} onClick={() => setReader((r) => ({ ...r, size: Math.max(14, r.size - 1) }))}>A<span>−</span></button>
           <output aria-live="polite" aria-label="Current font size">{reader.size}px</output>

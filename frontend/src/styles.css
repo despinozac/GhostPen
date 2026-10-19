@@ -1202,6 +1202,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .summary-reader-options label { display: flex; flex-direction: column; gap: 6px; color: var(--reader-muted); font-size: 10px; }
 .summary-reader-options select { min-height: 30px; border: 1px solid var(--reader-line); background: var(--reader-paper); color: var(--reader-ink); border-radius: 5px; padding: 4px 8px; font-size: 11px; }
 .summary-reader-reset { border: 0; padding: 8px 0; background: transparent; color: var(--reader-muted); cursor: pointer; font-size: 11px; }
+.summary-thinking-toggle { display: flex; align-items: center; gap: 6px; min-height: 29px; color: var(--reader-muted); font-size: 11px; cursor: pointer; }
+.summary-thinking-toggle input { margin: 0; accent-color: var(--reader-accent); }
+.summary-thinking { max-width: 68ch; margin: 0 auto 20px; padding: 16px 20px; border: 1px solid var(--reader-line); border-radius: 8px; color: var(--reader-muted); background: var(--reader-paper); }
+.summary-thinking h2 { margin: 0 0 12px; font-size: 12px; }
 .summary-font-size { display: flex; align-items: center; gap: 3px; }
 .summary-font-size button { display: flex; align-items: center; justify-content: center; gap: 2px; width: 32px; height: 29px; border: 1px solid transparent; background: transparent; color: var(--reader-ink); border-radius: 5px; font-family: Georgia, serif; font-size: 16px; cursor: pointer; }
 .summary-font-size button span { font: 11px "Trebuchet MS", sans-serif; }
@@ -1249,7 +1253,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   .summary-bar { margin: 0 20px 14px; padding: 14px; }
   .summary-depth { flex-direction: column; align-items: flex-start; gap: 7px; }
   .summary-options { align-items: flex-end; }
-  .summary-reader-bar { margin: 0 20px; }
+  .summary-reader-bar { margin: 0 20px; flex-wrap: wrap; }
   .summary-body { padding: 20px; }
   .summary-paper { padding: 22px 20px 28px; }
   .summary-footer { padding-inline: 20px; }

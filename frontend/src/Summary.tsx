@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Icon } from "./icons";
 import { cancelAi, clipboardText, copyText, listenVoice, summarizeLink, summaryState, ttsSpeak, ttsStop, ttsWarmUp, type TtsState } from "./api";
 import { listen } from "./events";
 import { renderMarkdown } from "./markdown";
 import { openExternal } from "./oriel";
+import { splitSummaryThinking } from "./summaryThinking";
 
 // What the Zig side reports while it fetches and summarizes
 // (src/main.zig's summarize_link): the stage, the page it found and the
@@ -53,9 +54,10 @@ interface ReaderSettings {
   size: number;
   font: "serif" | "sans";
   spacing: "comfortable" | "compact";
+  showThinking: boolean;
 }
 
-const READER_DEFAULTS: ReaderSettings = { size: 17, font: "serif", spacing: "comfortable" };
+const READER_DEFAULTS: ReaderSettings = { size: 17, font: "serif", spacing: "comfortable", showThinking: false };
 
 function loadReaderSettings(): ReaderSettings {
   try {
@@ -64,6 +66,7 @@ function loadReaderSettings(): ReaderSettings {
       size: typeof saved?.size === "number" && Number.isFinite(saved.size) ? Math.max(14, Math.min(24, saved.size)) : 17,
       font: saved?.font === "sans" ? "sans" : "serif",
       spacing: saved?.spacing === "compact" ? "compact" : "comfortable",
+      showThinking: saved?.showThinking === true,
     };
   } catch {
     return READER_DEFAULTS;
@@ -85,7 +88,9 @@ export default function Summary() {
   const [state, setState] = useState<SummaryState>(EMPTY);
   const stateRef = useRef(state);
   const [markdown, setMarkdown] = useState("");
+  const { summary, thinking } = useMemo(() => splitSummaryThinking(markdown), [markdown]);
   const [html, setHtml] = useState("");
+  const [thinkingHtml, setThinkingHtml] = useState("");
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLElement>(null);
   // The built-in voice: the read-aloud controls below listen to its state.
@@ -149,9 +154,12 @@ export default function Summary() {
   // The markdown goes through the renderer a beat after it lands: the
   // summary can be long, and chunk-by-chunk parsing is waste.
   useEffect(() => {
-    const t = window.setTimeout(() => setHtml(renderMarkdown(markdown)), 90);
+    const t = window.setTimeout(() => {
+      setHtml(renderMarkdown(summary));
+      setThinkingHtml(reader.showThinking ? renderMarkdown(thinking) : "");
+    }, 90);
     return () => window.clearTimeout(t);
-  }, [markdown]);
+  }, [summary, thinking, reader.showThinking]);
 
   // While it writes, follow the bottom — but never drag the user back after
   // they scrolled up to read.
@@ -160,7 +168,7 @@ export default function Summary() {
     if (!el || state.state !== "writing") return;
     const chasing = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
     if (chasing) el.scrollTop = el.scrollHeight;
-  }, [html, state.state]);
+  }, [html, thinkingHtml, state.state]);
 
   // Esc: stop the model (its answer so far stays); the window's close
   // button hides it.
@@ -204,10 +212,10 @@ export default function Summary() {
           <button
             className={`summary-copy ${copied ? "done" : ""}`}
             title="Copy the whole summary (Markdown)"
-            disabled={!markdown}
+            disabled={!summary}
             onClick={async () => {
               try {
-                await copyText(markdown);
+                await copyText(summary);
                 setCopied(true);
                 window.setTimeout(() => setCopied(false), 1600);
               } catch {
@@ -221,8 +229,8 @@ export default function Summary() {
           <button
             className="summary-copy summary-speak"
             title={voicePlaying ? "Stop the built-in voice" : "Read the summary through the built-in voice"}
-            disabled={!markdown && !voicePlaying}
-            onClick={() => speak(markdown)}
+            disabled={!summary && !voicePlaying}
+            onClick={() => speak(summary)}
           >
             {voicePlaying ? "■ Stop" : "🔊 Read summary"}
           </button>
@@ -305,6 +313,14 @@ export default function Summary() {
             <button className="summary-reader-reset" onClick={() => setReader(READER_DEFAULTS)}>Reset</button>
           </div>
         </details>
+        <label className="summary-thinking-toggle">
+          <input
+            type="checkbox"
+            checked={reader.showThinking}
+            onChange={(e) => setReader((r) => ({ ...r, showThinking: e.target.checked }))}
+          />
+          Show thinking
+        </label>
         <div className="summary-font-size" role="group" aria-label="Font size">
           <button aria-label="Decrease font size" disabled={reader.size <= 14} onClick={() => setReader((r) => ({ ...r, size: Math.max(14, r.size - 1) }))}>A<span>−</span></button>
           <output aria-live="polite" aria-label="Current font size">{reader.size}px</output>
@@ -334,6 +350,12 @@ export default function Summary() {
                 <button className="summary-stop" onClick={() => cancelAi().catch(() => {})}>Stop</button>
               </div>
             )}
+            {reader.showThinking && thinkingHtml && (
+              <section className="summary-thinking" aria-label="Model thinking">
+                <h2>Thinking</h2>
+                <div className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: thinkingHtml }} />
+              </section>
+            )}
             {html ? (
               <div className="summary-paper">
                 <div className="summary-paper-meta">
@@ -359,7 +381,7 @@ export default function Summary() {
         )}
       </main>
       <footer className="summary-footer">
-        <span><span className={`summary-status-dot ${running ? "busy" : ""}`} />{running ? "Making sense of your source" : markdown ? "Your reading, distilled" : "A fresh perspective starts here"}</span>
+        <span><span className={`summary-status-dot ${running ? "busy" : ""}`} />{running ? "Making sense of your source" : summary ? "Your reading, distilled" : "A fresh perspective starts here"}</span>
         <span>{running ? "Esc to stop" : "Made with GhostPen"}</span>
       </footer>
     </div>

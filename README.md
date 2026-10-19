@@ -79,6 +79,16 @@ ghostpen-cli translate --lang French --stream "Good morning"
 ghostpen-cli profiles
 ```
 
+## Link summaries
+
+The Summary window keeps the summary separate from any thinking blocks the
+model includes, including Gemma's `Thinking Process:` output ending in
+`<channel|>`. **Show thinking**, next to Reading settings, reveals those
+blocks while the answer streams or after it finishes. Thinking is hidden by
+default, and the window remembers your choice. **Copy** and **Read summary**
+use only the summary, even when thinking is visible. This is a display
+preference; it does not enable reasoning on the model.
+
 ## Meetings
 
 Turn on **🎙 Meeting** in the captions bar, then Start: the captions also
@@ -311,6 +321,7 @@ device such as BlackHole.
 ## Tests
 
 ```sh
+npm --prefix frontend test # Summary thinking parser (Node.js 22+)
 zig build test            # AI client, settings, images, models
 tests/e2e.sh              # headless: select → trigger → Proofread → pasted; Playground streaming
 tests/e2e-audio.sh        # headless: captions overlay, dictation → proofread → clipboard

@@ -1217,6 +1217,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .summary-font-size button:disabled { opacity: .3; cursor: default; }
 .summary-thinking { max-width: 68ch; margin: 0 auto 20px; padding: 16px 20px; border: 1px solid var(--reader-line); border-radius: 8px; color: var(--reader-muted); background: var(--reader-paper); }
 .summary-thinking h2 { margin: 0 0 12px; font-size: 12px; }
+.summary-thinking-empty { margin: 0; font-size: 13px; line-height: 1.5; }
 .summary-font-size { display: flex; align-items: center; gap: 3px; }
 .summary-font-size button { width: 32px; font-family: Georgia, serif; font-size: 16px; }
 .summary-font-size button span { font: 11px "Trebuchet MS", sans-serif; }

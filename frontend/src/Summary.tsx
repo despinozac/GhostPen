@@ -9,7 +9,7 @@ import { openExternal } from "./oriel";
 // (src/main.zig's summarize_link): the stage, the page it found and the
 // markdown so far — the page can miss events while it loads, so it also
 // picks the state up through `summary_state`.
-const EMPTY: SummaryState = { state: "", title: "", chars: 0, message: "", markdown: "", thinking: "", revision: 0 };
+const EMPTY: SummaryState = { state: "", title: "", chars: 0, message: "", markdown: "", thinking: "", thinking_requested: false, revision: 0 };
 
 const STAGE: Record<string, string> = {
   fetching: "Fetching the page…",
@@ -62,6 +62,33 @@ function loadReaderSettings(): ReaderSettings {
   }
 }
 
+// Render at a bounded cadence during continuous output. A trailing debounce
+// can postpone every update until the model stops sending chunks.
+function useStreamingMarkdown(source: string): string {
+  const latest = useRef(source);
+  const timer = useRef<number | null>(null);
+  const [html, setHtml] = useState("");
+  useEffect(() => {
+    latest.current = source;
+    if (!source) {
+      if (timer.current !== null) window.clearTimeout(timer.current);
+      timer.current = null;
+      setHtml("");
+    } else if (timer.current === null) {
+      timer.current = window.setTimeout(() => {
+        timer.current = null;
+        setHtml(renderMarkdown(latest.current));
+      }, 90);
+    }
+  }, [source]);
+  useEffect(() => () => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+  }, []);
+  // Hide/reset immediately, even before the effect clears the previous HTML.
+  return source ? html : "";
+}
+
 export default function Summary() {
   const [reader, setReader] = useState<ReaderSettings>(loadReaderSettings);
   useEffect(() => {
@@ -78,8 +105,8 @@ export default function Summary() {
   const [markdown, setMarkdown] = useState("");
   const [thinking, setThinking] = useState("");
   const summary = markdown.trim();
-  const [html, setHtml] = useState("");
-  const [thinkingHtml, setThinkingHtml] = useState("");
+  const html = useStreamingMarkdown(summary);
+  const thinkingHtml = useStreamingMarkdown(reader.showThinking ? thinking : "");
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLElement>(null);
   // The built-in voice: the read-aloud controls below listen to its state.
@@ -167,16 +194,6 @@ export default function Summary() {
       .catch(() => {});
   }, []);
 
-  // The markdown goes through the renderer a beat after it lands: the
-  // summary can be long, and chunk-by-chunk parsing is waste.
-  useEffect(() => {
-    const t = window.setTimeout(() => {
-      setHtml(renderMarkdown(summary));
-      setThinkingHtml(reader.showThinking ? renderMarkdown(thinking) : "");
-    }, 90);
-    return () => window.clearTimeout(t);
-  }, [summary, thinking, reader.showThinking]);
-
   // While it writes, follow the bottom — but never drag the user back after
   // they scrolled up to read.
   useEffect(() => {
@@ -185,6 +202,12 @@ export default function Summary() {
     const chasing = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
     if (chasing) el.scrollTop = el.scrollHeight;
   }, [html, thinkingHtml, state.state]);
+
+  // Revealing a section above the answer must bring it into view, even if
+  // the reader finished at the bottom of a long summary.
+  useEffect(() => {
+    if (reader.showThinking && bodyRef.current) bodyRef.current.scrollTop = 0;
+  }, [reader.showThinking]);
 
   // Esc: stop the model (its answer so far stays); the window's close
   // button hides it.
@@ -204,7 +227,7 @@ export default function Summary() {
     if (!URL_SHAPE.test(u) || running) return;
     setPending(true);
     try {
-      await summarizeLink(u, level);
+      await summarizeLink(u, level, reader.showThinking);
     } catch {
       // The failure is in the window's body already (summarize_link reports
       // there, not here).
@@ -329,7 +352,7 @@ export default function Summary() {
             <button className="summary-reader-reset" onClick={() => setReader(READER_DEFAULTS)}>Reset</button>
           </div>
         </details>
-        <label className="summary-thinking-switch">
+        <label className="summary-thinking-switch" title="Show received thinking and request it for the next summary">
           <input
             type="checkbox"
             role="switch"
@@ -346,56 +369,65 @@ export default function Summary() {
         </div>
       </div>
       <main className="summary-body" ref={bodyRef}>
-        {state.state === "error" ? (
+        {state.state === "error" && (
           <div className="summary-error" role="alert">
             <span className="summary-eyebrow">Let's try again</span>
             <h2>We couldn't read this link.</h2>
             <p className="summary-error-title">{state.message || "Check the URL and try summarizing again."}</p>
             {state.title ? <p className="hint">{state.title}</p> : null}
           </div>
-        ) : (
-          <>
-            {running && (
-              <div className="summary-status" role="status" aria-live="polite">
-                <div className="spinner" />
-                <div className="summary-status-text">
-                  <span className="summary-stage">{STAGE[state.state] || "Working…"}</span>
-                  {state.title ? <span className="summary-title">{state.title}</span> : null}
-                  {state.chars > 0 && (state.state === "reading" || state.state === "writing") ? (
-                    <span className="summary-chars">{state.chars.toLocaleString()} characters read</span>
-                  ) : null}
-                </div>
-                <button className="summary-stop" onClick={() => cancelAi().catch(() => {})}>Stop</button>
-              </div>
+        )}
+        {running && state.state !== "error" && (
+          <div className="summary-status" role="status" aria-live="polite">
+            <div className="spinner" />
+            <div className="summary-status-text">
+              <span className="summary-stage">{STAGE[state.state] || "Working…"}</span>
+              {state.title ? <span className="summary-title">{state.title}</span> : null}
+              {state.chars > 0 && (state.state === "reading" || state.state === "writing") ? (
+                <span className="summary-chars">{state.chars.toLocaleString()} characters read</span>
+              ) : null}
+            </div>
+            <button className="summary-stop" onClick={() => cancelAi().catch(() => {})}>Stop</button>
+          </div>
+        )}
+        {reader.showThinking && (
+          <section className="summary-thinking" aria-label="Model thinking">
+            <h2>Thinking</h2>
+            {thinkingHtml ? (
+              <div className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: thinkingHtml }} />
+            ) : (
+              <p className="summary-thinking-empty" role="status">
+                {!state.state || (pending && state.state === "ready")
+                  ? "Thinking will be requested when you summarize."
+                  : !state.thinking_requested
+                    ? "Thinking wasn't requested for this summary. Summarize again with Show thinking on to request it."
+                    : state.state === "ready" || state.state === "error"
+                      ? "This response didn't include thinking, even though it was requested."
+                      : "Waiting for the model's thinking…"}
+              </p>
             )}
-            {reader.showThinking && thinkingHtml && (
-              <section className="summary-thinking" aria-label="Model thinking">
-                <h2>Thinking</h2>
-                <div className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: thinkingHtml }} />
-              </section>
-            )}
-            {html ? (
-              <div className="summary-paper">
-                <div className="summary-paper-meta">
-                  <span className="summary-eyebrow">The essentials</span>
-                  <span>{running ? "Writing…" : "Ready to read"}</span>
-                </div>
-                {state.title && <h2 className="summary-document-title">{state.title}</h2>}
-                <article className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: html }} />
-              </div>
-            ) : running ? null : (
-              <div className="summary-empty">
-                <div className="summary-illustration" aria-hidden="true">
-                  <div className="summary-mini-page"><span /><i /><i /><i /><b /><i /><i /></div>
-                  <span className="summary-illustration-badge"><Icon name="concise" /></span>
-                </div>
-                <span className="summary-eyebrow">From the page to the point</span>
-                <h2>Big ideas. Less noise.</h2>
-                <p>Drop in a link and we'll bring the key ideas,<br className="summary-empty-break" /> useful details, and takeaways into focus.</p>
-                <div className="summary-empty-note"><Icon name="link" /> Articles, essays, and webpages</div>
-              </div>
-            )}
-          </>
+          </section>
+        )}
+        {html ? (
+          <div className="summary-paper">
+            <div className="summary-paper-meta">
+              <span className="summary-eyebrow">The essentials</span>
+              <span>{running ? "Writing…" : "Ready to read"}</span>
+            </div>
+            {state.title && <h2 className="summary-document-title">{state.title}</h2>}
+            <article className="md" onClick={openLink} dangerouslySetInnerHTML={{ __html: html }} />
+          </div>
+        ) : running || state.state === "error" ? null : (
+          <div className="summary-empty">
+            <div className="summary-illustration" aria-hidden="true">
+              <div className="summary-mini-page"><span /><i /><i /><i /><b /><i /><i /></div>
+              <span className="summary-illustration-badge"><Icon name="concise" /></span>
+            </div>
+            <span className="summary-eyebrow">From the page to the point</span>
+            <h2>Big ideas. Less noise.</h2>
+            <p>Drop in a link and we'll bring the key ideas,<br className="summary-empty-break" /> useful details, and takeaways into focus.</p>
+            <div className="summary-empty-note"><Icon name="link" /> Articles, essays, and webpages</div>
+          </div>
         )}
       </main>
       <footer className="summary-footer">

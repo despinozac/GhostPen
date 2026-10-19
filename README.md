@@ -82,11 +82,13 @@ ghostpen-cli profiles
 ## Link summaries
 
 The Summary window keeps exposed model thinking separate from the summary.
-The **Show thinking** switch reveals it while the answer streams or
-after it finishes. Thinking is hidden by default, and the window remembers
-your choice. **Copy** and **Read summary** use only the summary, even when
-thinking is visible. This is a display preference; it does not enable
-reasoning on the model or reveal reasoning a provider does not expose.
+The **Show thinking** switch requests thinking for the next summary and
+reveals any thinking already received, during generation or after it finishes.
+It is off by default, and the window remembers your choice. Turning it on
+after a run started with thinking off requires summarizing again to request
+thinking; the reader explains this when there is nothing to reveal. Models
+or providers may not expose thinking even when requested. **Copy** and
+**Read summary** use only the summary, even when thinking is visible.
 
 Channels are normalized in the backend from provider reasoning fields,
 explicit leading reasoning blocks, or a thought channel opened by the local
@@ -339,7 +341,9 @@ the old empty-thought prefill produced `Thinking Process: … <channel|>Answer`,
 while the plain model-turn prompt produced only the summary. Both runs used
 the same synthetic article, seed 42, temperature 0.2, 4096-token context, and
 a CPU-only validation build of the same application sources (Metal disabled
-in the temporary build's Oriel dependency). This is evidence for that case,
+in the temporary build's Oriel dependency). A third captured run with
+`think=true` contains both channels; its regression checks that no thinking
+enters the answer before or after completion. This is evidence for that case,
 not a guarantee about arbitrary unmarked model prose.
 
 To repeat the live check with an already installed E4B model and your built
@@ -348,6 +352,9 @@ GhostPen executable (no downloads or settings changes):
 ```sh
 python3 tests/summary-live.py --exe zig-out/bin/ghostpen-dev \
   --model "/path/to/gemma-4-E4B-it-Q4_K_M.gguf" --record /tmp/summary-live.jsonl
+# Request thinking and check that it is followed by the summary:
+python3 tests/summary-live.py --exe zig-out/bin/ghostpen-dev \
+  --model "/path/to/gemma-4-E4B-it-Q4_K_M.gguf" --thinking
 ```
 
 The end-to-end tests run on a private X display (Xvfb + D-Bus) against a mock

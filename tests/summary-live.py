@@ -19,10 +19,11 @@ def main():
     parser.add_argument("--exe", type=Path, required=True, help="built GhostPen executable")
     parser.add_argument("--model", type=Path, required=True, help="installed Gemma E4B GGUF")
     parser.add_argument("--cpu", action="store_true", help="request the runner's CPU mode")
+    parser.add_argument("--thinking", action="store_true", help="request thinking and verify both channels are returned")
     parser.add_argument("--record", type=Path, help="save raw helper JSONL, including output")
     args = parser.parse_args()
     fixture = json.loads((Path(__file__).resolve().parents[1] / "src/fixtures/summary-gemma4-e4b.json").read_text())
-    request = fixture["request"]
+    request = {**fixture["request"], "think": args.thinking}
     command = [str(args.exe.resolve()), "--llm-helper", "--model", str(args.model.resolve()), "--ctx", "4096"]
     if args.cpu:
         command.append("--cpu")
@@ -57,13 +58,18 @@ def main():
                 if event.get("done"):
                     completion = event
         output = "".join(chunks)
-        assert producer and producer["format"] == "gemma4" and producer["initial_thinking"] is False, producer
+        assert producer and producer["format"] == "gemma4" and producer["initial_thinking"] is args.thinking, producer
         assert not completion["cancelled"] and not completion["truncated"], completion
         assert "## Key points" in output and "## Details" in output, "Missing expected summary sections"
         # These assertions belong to this controlled regression fixture, not
         # to production filtering of arbitrary article headings or prose.
-        assert not output.lstrip().startswith("Thinking Process:"), "Original reasoning preamble reproduced"
-        assert "<channel|>" not in output and "<|channel>thought" not in output, "Unexpected thought-channel output"
+        if args.thinking:
+            thinking, separator, answer = output.partition("<channel|>")
+            assert separator and thinking.strip() and answer.strip(), "Missing thinking/answer boundary"
+            assert "## Key points" in answer and "## Details" in answer, "Summary must follow thinking"
+        else:
+            assert not output.lstrip().startswith("Thinking Process:"), "Original reasoning preamble reproduced"
+            assert "<channel|>" not in output and "<|channel>thought" not in output, "Unexpected thought-channel output"
         print(json.dumps({"passed": True, "producer": producer, "completion": completion, "output_chars": len(output)}, indent=2))
     finally:
         selector.close()

@@ -138,6 +138,39 @@ pub const Stream = struct {
 
 fn ignore(_: void, _: Delta) void {}
 
+test "live E4B thinking-on output keeps thoughts separate through completion" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = struct {
+        thinking_on: struct {
+            producer: struct { format: chat_format.Format, initial_thinking: bool },
+            chunks: []const []const u8,
+            completion: struct { truncated: bool, cancelled: bool },
+        },
+    };
+    const fixture = try std.json.parseFromSliceLeaky(Fixture, a, @embedFile("fixtures/summary-gemma4-e4b.json"), .{ .ignore_unknown_fields = true });
+    const run = fixture.thinking_on;
+    try std.testing.expect(run.producer.initial_thinking);
+    try std.testing.expect(!run.completion.truncated and !run.completion.cancelled);
+    var s = Stream.forPrompt(a, run.producer.format, true);
+    var raw: std.ArrayList(u8) = .empty;
+    const close = chat_format.reasoning(run.producer.format).?.close;
+    for (run.chunks) |chunk| {
+        try raw.appendSlice(a, chunk);
+        try s.feed(chunk, {}, ignore);
+        if (std.mem.indexOf(u8, raw.items, close) == null)
+            try std.testing.expectEqualStrings("", s.answer.items);
+    }
+    try s.finish({}, ignore);
+    const boundary = std.mem.indexOf(u8, raw.items, close).?;
+    try std.testing.expect(boundary > 0);
+    try std.testing.expectEqualStrings(raw.items[0..boundary], s.thinking.items);
+    try std.testing.expectEqualStrings(raw.items[boundary + close.len ..], s.answer.items);
+    try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "## Key points") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.answer.items, "## Details") != null);
+}
+
 test "live E4B Summary fixture uses the production thinking-off prompt and initial channel" {
     const web_page = @import("web_page.zig");
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

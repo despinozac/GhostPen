@@ -39,7 +39,7 @@ before(async () => {
 });
 
 let listeners, calls, snapshot, getSnapshot, resolveRun;
-const empty = { state: '', title: '', chars: 0, message: '', markdown: '', thinking: '', revision: 0 };
+const empty = { state: '', title: '', chars: 0, message: '', markdown: '', thinking: '', thinking_requested: false, revision: 0 };
 const answer = '## Key points\n\nThe article explains renewable energy.';
 const thoughts = 'Analyze the request. Private reasoning without a heading.';
 
@@ -60,7 +60,11 @@ beforeEach(() => {
       calls.push({ name, args });
       if (name === 'summary_state') return getSnapshot();
       if (name === 'clipboard_text') return 'https://example.com/article';
-      if (name === 'summarize_link') return new Promise((resolve) => { resolveRun = resolve; });
+      if (name === 'summarize_link') {
+        snapshot.thinking_requested = args.thinking;
+        emitStatus('fetching');
+        return new Promise((resolve) => { resolveRun = resolve; });
+      }
       if (name === 'cancel_ai') {
         emitStatus('error', 'Cancelled.');
         resolveRun?.();
@@ -133,7 +137,10 @@ test('toolbar switch is a focusable native checkbox, persists, and Reset restore
   assert.equal(toggle().checked, false);
   toggle().focus();
   assert.equal(document.activeElement, toggle());
+  const body = screen.getByRole('main');
+  body.scrollTop = 600;
   await click(screen.getByText('Show thinking'));
+  assert.equal(body.scrollTop, 0, 'Revealed thinking must not remain above the visible answer');
   assert.equal(screen.getByRole('switch', { name: 'Show thinking', checked: true }), toggle());
   assert.equal(toggle().checked, true);
   assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Analyze the request/);
@@ -145,6 +152,92 @@ test('toolbar switch is a focusable native checkbox, persists, and Reset restore
   assert.equal(toggle().checked, false);
   assert.equal(screen.queryByRole('region', { name: 'Model thinking' }), null);
   assert.equal(JSON.parse(localStorage.getItem('ghostpen-summary-reader')).showThinking, false);
+});
+
+test('thinking becomes visible during a continuous stream without waiting for a pause', async () => {
+  await mount();
+  await status('writing');
+  await click(toggle());
+  for (let i = 0; i < 20; i++) {
+    act(() => emitDelta('thinking', `Step ${i}. `));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  }
+  const region = screen.queryByRole('region', { name: 'Model thinking' });
+  assert.ok(region?.textContent.includes('Step 0.'), 'Thinking must render before the stream pauses');
+  assert.equal(copy().disabled, true);
+  assert.equal(read().disabled, true);
+  await status('ready');
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Step 19/);
+});
+
+test('an enabled switch explains when a completed response has no thinking', async () => {
+  snapshot = { ...empty, state: 'ready', markdown: answer, revision: 1 };
+  await mount();
+  await click(toggle());
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Thinking wasn't requested.*Summarize again/);
+  assert.equal(calls.some((c) => c.name === 'summarize_link'), false, 'Showing an old result must not silently regenerate it');
+  await click(copy());
+  await click(read());
+  assert.deepEqual(calls.filter((c) => ['copy_text', 'tts_speak'].includes(c.name)).map((c) => c.args.text), [answer, answer]);
+});
+
+test('the switch requests thinking on the next run and can hide/reveal it after completion', async () => {
+  await mount();
+  const run = () => screen.getByRole('button', { name: 'Summarize', exact: true });
+  await click(run());
+  assert.deepEqual(calls.find((c) => c.name === 'summarize_link').args, {
+    url: 'https://example.com/article', level: 'standard', thinking: false,
+  });
+  await click(toggle());
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Thinking wasn't requested/);
+  assert.equal(calls.filter((c) => c.name === 'summarize_link').length, 1);
+  await act(async () => { emitStatus('ready'); resolveRun(); });
+  await tick();
+  await click(run());
+  assert.equal(calls.filter((c) => c.name === 'summarize_link').at(-1).args.thinking, true);
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Waiting for the model/);
+  await delta('thinking', thoughts);
+  await delta('answer', answer);
+  await act(async () => { emitStatus('ready'); resolveRun(); });
+  await tick();
+  await click(toggle());
+  assert.equal(screen.queryByRole('region', { name: 'Model thinking' }), null);
+  await click(toggle());
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Private reasoning/);
+  await click(copy());
+  await click(read());
+  assert.deepEqual(calls.filter((c) => ['copy_text', 'tts_speak'].includes(c.name)).map((c) => c.args.text), [answer, answer]);
+  await unmount();
+  await mount();
+  assert.equal(toggle().checked, true);
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Private reasoning/);
+  await click(run());
+  assert.equal(calls.filter((c) => c.name === 'summarize_link').at(-1).args.thinking, true, 'Saved preference must apply to requests');
+  assert.equal(document.body.textContent.includes(thoughts), false, 'A new run must not render stale thinking');
+  await click(toggle());
+  await act(async () => { emitStatus('ready'); resolveRun(); });
+  await click(run());
+  assert.equal(calls.filter((c) => c.name === 'summarize_link').at(-1).args.thinking, false);
+  await act(async () => resolveRun());
+});
+
+test('a model that returned no thinking despite the request is explained after reopening', async () => {
+  localStorage.setItem('ghostpen-summary-reader', JSON.stringify({ showThinking: true }));
+  snapshot = { ...empty, state: 'ready', thinking_requested: true, markdown: answer, revision: 1 };
+  await mount();
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /didn't include thinking, even though it was requested/);
+});
+
+test('received thinking remains available after cancellation without enabling Copy or Read', async () => {
+  await mount();
+  await status('writing');
+  await delta('thinking', thoughts);
+  await click(screen.getByRole('button', { name: 'Stop', exact: true }));
+  await click(toggle());
+  assert.match(screen.getByRole('alert').textContent, /Cancelled/);
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Private reasoning/);
+  assert.equal(copy().disabled, true);
+  assert.equal(read().disabled, true);
 });
 
 test('structured stream and reopened snapshot give identical summary, thinking and Copy/TTS payloads', async () => {
@@ -183,7 +276,7 @@ test('ordinary Thinking Process headings and literal tokens remain readable and 
   assert.equal(calls.find((c) => c.name === 'copy_text').args.text, text);
   assert.equal(calls.find((c) => c.name === 'tts_speak').args.text, text);
   await click(toggle());
-  assert.equal(screen.queryByRole('region', { name: 'Model thinking' }), null);
+  assert.match(screen.getByRole('region', { name: 'Model thinking' }).textContent, /Thinking wasn't requested/);
 });
 
 test('events arriving around snapshot hydration are neither lost nor duplicated', async () => {

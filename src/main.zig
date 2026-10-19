@@ -177,7 +177,7 @@ pub const Events = struct {
     @"ghostpen://update-progress": updates.Progress,
     /// The summarize-link flow's state (to the Summary window); the
     /// accumulating markdown travels in summary-chunk.
-    @"ghostpen://summary-status": struct { state: []const u8, title: []const u8, chars: usize, message: []const u8, revision: u64 },
+    @"ghostpen://summary-status": struct { state: []const u8, title: []const u8, chars: usize, message: []const u8, thinking_requested: bool, revision: u64 },
     @"ghostpen://summary-chunk": struct { channel: ai.channels.Channel, text: []const u8, revision: u64 },
     /// A meeting's save pipeline (src/meetings.zig): its state and progress
     /// (0–1 within the state); `message` an error or a note.
@@ -277,6 +277,8 @@ pub const SummaryState = struct {
     message: []const u8 = "",
     markdown: []const u8 = "",
     thinking: []const u8 = "",
+    /// Captured when this run starts; a display toggle cannot change it mid-run.
+    thinking_requested: bool = false,
     revision: u64 = 0,
     /// The page's readable text, for the read-aloud control (trimmed at a
     /// sane limit; "" when the summary came from beyond a page — empty only
@@ -309,7 +311,7 @@ fn summaryStoreLocked(state: []const u8, title: []const u8, chars: usize, messag
     gpa.free(summary_message);
     summary_title = t;
     summary_message = m;
-    link_summary = .{ .state = state, .title = t, .chars = chars, .message = m, .markdown = summary_markdown.items, .thinking = summary_thinking.items, .revision = link_summary.revision + 1 };
+    link_summary = .{ .state = state, .title = t, .chars = chars, .message = m, .markdown = summary_markdown.items, .thinking = summary_thinking.items, .thinking_requested = link_summary.thinking_requested, .revision = link_summary.revision + 1 };
 }
 
 fn summarySet(state: []const u8, title: []const u8, chars: usize, message: []const u8) void {
@@ -322,6 +324,7 @@ fn summarySet(state: []const u8, title: []const u8, chars: usize, message: []con
         .title = link_summary.title,
         .chars = link_summary.chars,
         .message = link_summary.message,
+        .thinking_requested = link_summary.thinking_requested,
         .revision = link_summary.revision,
     }) catch {};
 }
@@ -872,7 +875,7 @@ pub const Commands = struct {
     /// profile and stream the answer to the summary window as Markdown.
     /// Failures of the page or the model report to the window, not the menu
     /// (the menu is already behind the window the user is looking at).
-    pub fn summarize_link(arena: std.mem.Allocator, args: struct { url: []const u8, level: ?[]const u8 = null }) !void {
+    pub fn summarize_link(arena: std.mem.Allocator, args: struct { url: []const u8, level: ?[]const u8 = null, thinking: bool = false }) !void {
         try acquireBusy();
         defer busy.store(false, .release);
         const url = std.mem.trim(u8, args.url, " \t\r\n");
@@ -883,6 +886,7 @@ pub const Commands = struct {
             defer summary_mutex.unlock(io);
             summary_markdown.clearRetainingCapacity();
             summary_thinking.clearRetainingCapacity();
+            link_summary.thinking_requested = args.thinking;
             if (summary_page_text.len > 0) gpa.free(summary_page_text);
             summary_page_text = &.{};
         }
@@ -937,7 +941,7 @@ pub const Commands = struct {
             .profile = (try shared.get(io, arena)).activeProfile(),
             .system = try web_page.summaryPrompt(arena, web_page.parseLevel(args.level)),
             .user = .{ .text = try pd.prompt(arena) },
-        }, &emit, Emit.chunk, &ai_diag) catch |err| {
+        }, args.thinking, &emit, Emit.chunk, &ai_diag) catch |err| {
             const msg: []const u8 = if (err == error.AiFailed) ai_diag.message else @errorName(err);
             summarySet("error", pd.title, pd.text.len, msg);
             log.warn("summarize: the AI request failed: {s}", .{msg});

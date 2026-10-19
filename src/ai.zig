@@ -3,8 +3,8 @@
 //!
 //! Ported from GhostPen's ai.rs: the same prompts (verbatim), SSE streaming,
 //! vision input for OCR, `GET /models`, and bounded requests with readable
-//! errors. Thinking (the reasoning phase) is always off: every action is a
-//! direct rewrite, and a reasoning pass only costs time.
+//! errors. Editing actions keep thinking off; the Summary reader can request
+//! it explicitly and receive it separately from the answer.
 
 const std = @import("std");
 const settings = @import("settings.zig");
@@ -288,14 +288,14 @@ pub fn complete(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, re
 }
 
 /// An empty answer is an error; one that reads like the model's reasoning
-/// is logged (and returned: the reasoning phase stays off).
+/// is logged and returned rather than classified by prose heuristics.
 fn checked(out: []const u8, req: Request, diag: *Diag) Error![]const u8 {
     if (out.len == 0) return fail(diag, "Model returned empty output");
     const input: ?[]const u8 = switch (req.user) {
         .text => |t| t,
         .image_with_text => null,
     };
-    if (looksLikeReasoning(out, input)) std.log.warn("the answer reads like the model's reasoning (thinking is off); try another model", .{});
+    if (looksLikeReasoning(out, input)) std.log.warn("the answer reads like the model's reasoning; try another model", .{});
     return out;
 }
 
@@ -317,16 +317,17 @@ pub fn completeStream(
         }
     };
     var forward: Forward = .{ .ctx = ctx };
-    return completeStreamChannels(io, gpa, arena, req, &forward, Forward.chunk, diag);
+    return completeStreamChannels(io, gpa, arena, req, false, &forward, Forward.chunk, diag);
 }
 
 /// Explicit exposed channels for readers. Other streaming callers receive
-/// only the answer through completeStream's adapter above.
+/// only the answer through completeStream's adapter above, with thinking off.
 pub fn completeStreamChannels(
     io: std.Io,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     req: Request,
+    thinking: bool,
     ctx: anytype,
     comptime on_chunk: fn (@TypeOf(ctx), channels.Delta) void,
     diag: *Diag,
@@ -344,7 +345,7 @@ pub fn completeStreamChannels(
             .user = text,
             .image = image,
             .temperature = req.profile.temperature,
-            .think = false,
+            .think = thinking,
             .max_tokens = max_tokens,
         }, ctx, on_chunk, &message) catch |err| switch (err) {
             error.LocalFailed => return fail(diag, message),
@@ -353,7 +354,7 @@ pub fn completeStreamChannels(
         if (res.cancelled) return fail(diag, "Cancelled.");
         return checked(std.mem.trim(u8, res.text, " \t\r\n"), req, diag);
     }
-    const body = try buildBody(arena, req, false, true);
+    const body = try buildBody(arena, req, thinking, true);
     var sink: SseSink(@TypeOf(ctx), on_chunk) = .{ .arena = arena, .ctx = ctx };
     sink.init();
     const status = exchange(io, gpa, arena, .POST, try endpoint(arena, req.profile.baseUrl, "/chat/completions"), req.profile.apiKey, body, &sink.writer, diag) catch |err| {
@@ -678,17 +679,20 @@ test buildBody {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const body = try buildBody(a, .{
-        .profile = settings.default_profile,
-        .system = "sys",
-        .user = .{ .image_with_text = .{ .text = ocr_user_text, .png = "PNG" } },
-    }, false, true);
-    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
-    try std.testing.expectEqualStrings("gemma4:e4b", v.object.get("model").?.string);
-    const content = v.object.get("messages").?.array.items[1].object.get("content").?.array.items;
-    try std.testing.expectEqualStrings("data:image/png;base64,UE5H", content[1].object.get("image_url").?.object.get("url").?.string);
-    try std.testing.expectEqual(false, v.object.get("think").?.bool);
-    try std.testing.expectEqual(true, v.object.get("stream").?.bool);
+    for ([_]bool{ false, true }) |thinking| {
+        const body = try buildBody(a, .{
+            .profile = settings.default_profile,
+            .system = "sys",
+            .user = .{ .image_with_text = .{ .text = ocr_user_text, .png = "PNG" } },
+        }, thinking, true);
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try std.testing.expectEqualStrings("gemma4:e4b", v.object.get("model").?.string);
+        const content = v.object.get("messages").?.array.items[1].object.get("content").?.array.items;
+        try std.testing.expectEqualStrings("data:image/png;base64,UE5H", content[1].object.get("image_url").?.object.get("url").?.string);
+        try std.testing.expectEqual(thinking, v.object.get("think").?.bool);
+        try std.testing.expectEqual(thinking, v.object.get("chat_template_kwargs").?.object.get("enable_thinking").?.bool);
+        try std.testing.expectEqual(true, v.object.get("stream").?.bool);
+    }
 }
 
 test "SSE sink" {

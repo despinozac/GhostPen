@@ -1,26 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Icon } from "./icons";
-import { cancelAi, clipboardText, copyText, listenVoice, summarizeLink, summaryState, ttsSpeak, ttsStop, ttsWarmUp, type TtsState } from "./api";
+import { cancelAi, clipboardText, copyText, listenVoice, summarizeLink, summaryState, ttsSpeak, ttsStop, ttsWarmUp, type TtsState, type SummaryState, type SummaryDelta, type SummaryStatus } from "./api";
 import { listen } from "./events";
 import { renderMarkdown } from "./markdown";
 import { openExternal } from "./oriel";
-import { splitSummaryThinking } from "./summaryThinking";
 
 // What the Zig side reports while it fetches and summarizes
 // (src/main.zig's summarize_link): the stage, the page it found and the
 // markdown so far — the page can miss events while it loads, so it also
 // picks the state up through `summary_state`.
-interface SummaryState {
-  state: string;
-  title: string;
-  chars: number;
-  message: string;
-  markdown: string;
-  /** The page's readable text (the read-aloud's whole-page source). */
-  page_text?: string;
-}
-
-const EMPTY: SummaryState = { state: "", title: "", chars: 0, message: "", markdown: "" };
+const EMPTY: SummaryState = { state: "", title: "", chars: 0, message: "", markdown: "", thinking: "", revision: 0 };
 
 const STAGE: Record<string, string> = {
   fetching: "Fetching the page…",
@@ -86,9 +75,9 @@ export default function Summary() {
   // events may lag behind it).
   const [pending, setPending] = useState(false);
   const [state, setState] = useState<SummaryState>(EMPTY);
-  const stateRef = useRef(state);
   const [markdown, setMarkdown] = useState("");
-  const { summary, thinking } = useMemo(() => splitSummaryThinking(markdown), [markdown]);
+  const [thinking, setThinking] = useState("");
+  const summary = markdown.trim();
   const [html, setHtml] = useState("");
   const [thinkingHtml, setThinkingHtml] = useState("");
   const [copied, setCopied] = useState(false);
@@ -106,35 +95,62 @@ export default function Summary() {
   // (listeners attach after the first status was broadcast).
   useEffect(() => {
     const ups: Promise<unknown>[] = [];
+    type Update = { kind: "status"; data: SummaryStatus } | { kind: "delta"; data: SummaryDelta };
+    const waiting: Update[] = [];
+    let ready = false;
+    let active = true;
+    let revision = 0;
+    const apply = (update: Update) => {
+      if (!active || update.data.revision <= revision) return;
+      revision = update.data.revision;
+      if (update.kind === "delta") {
+        const append = update.data.channel === "thinking" ? setThinking : setMarkdown;
+        append((text) => text + update.data.text);
+      } else {
+        const s = update.data;
+        if (s.page_text !== undefined) pageTextRef.current = s.page_text || "";
+        setState((previous) => ({ ...previous, ...s }));
+        if (s.state === "fetching") {
+          setMarkdown("");
+          setThinking("");
+        }
+      }
+    };
+    const receive = (update: Update) => {
+      if (!active) return;
+      if (ready) apply(update);
+      else waiting.push(update);
+    };
     ups.push(
-      listen<SummaryState>("ghostpen://summary-status", (e) => {
-        stateRef.current = e.payload;
-        if (e.payload.page_text !== undefined) pageTextRef.current = e.payload.page_text || "";
-        setState(e.payload);
-        // A fresh run resets the body (the picker-up never does: it only
-        // fills a page that started empty).
-        if (e.payload.state === "fetching") setMarkdown("");
-      }),
+      listen<SummaryStatus>("ghostpen://summary-status", (e) => receive({ kind: "status", data: e.payload })),
     );
     ups.push(
-      listen<string>("ghostpen://summary-chunk", (e) => {
-        setMarkdown((m) => m + e.payload);
-      }),
+      listen<SummaryDelta>("ghostpen://summary-chunk", (e) => receive({ kind: "delta", data: e.payload })),
     );
     ups.push(listenVoice(setVoice));
     // The reader opened: load the voice now so Read starts sooner.
     ttsWarmUp().catch(() => {});
-    summaryState()
+    Promise.all(ups).then(() => summaryState())
       .then((s) => {
+        if (!active) return;
         pageTextRef.current = s.page_text || "";
-        if (!stateRef.current.state && s.state) {
-          stateRef.current = s;
-          setState(s);
-          setMarkdown(s.markdown || "");
-        }
+        setState(s);
+        setMarkdown(s.markdown);
+        setThinking(s.thinking);
+        revision = s.revision;
+        ready = true;
+        // A snapshot includes events emitted before its lock was acquired.
+        // Replay only newer ones, avoiding dropped or duplicated text.
+        for (const update of waiting) apply(update);
+        waiting.length = 0;
       })
-      .catch(() => {});
+      .catch(() => {
+        ready = true;
+        for (const update of waiting) apply(update);
+        waiting.length = 0;
+      });
     return () => {
+      active = false;
       Promise.allSettled(ups).then((all) => {
         for (const r of all) if (r.status === "fulfilled") (r.value as () => void)();
       });
@@ -313,14 +329,14 @@ export default function Summary() {
             <button className="summary-reader-reset" onClick={() => setReader(READER_DEFAULTS)}>Reset</button>
           </div>
         </details>
-        <label className="summary-thinking-toggle">
-          <input
-            type="checkbox"
-            checked={reader.showThinking}
-            onChange={(e) => setReader((r) => ({ ...r, showThinking: e.target.checked }))}
-          />
+        <button
+          type="button"
+          className="summary-reader-button summary-thinking-toggle"
+          aria-pressed={reader.showThinking}
+          onClick={() => setReader((r) => ({ ...r, showThinking: !r.showThinking }))}
+        >
           Show thinking
-        </label>
+        </button>
         <div className="summary-font-size" role="group" aria-label="Font size">
           <button aria-label="Decrease font size" disabled={reader.size <= 14} onClick={() => setReader((r) => ({ ...r, size: Math.max(14, r.size - 1) }))}>A<span>−</span></button>
           <output aria-live="polite" aria-label="Current font size">{reader.size}px</output>

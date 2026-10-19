@@ -81,13 +81,18 @@ ghostpen-cli profiles
 
 ## Link summaries
 
-The Summary window keeps the summary separate from any thinking blocks the
-model includes, including Gemma's `Thinking Process:` output ending in
-`<channel|>`. **Show thinking**, next to Reading settings, reveals those
-blocks while the answer streams or after it finishes. Thinking is hidden by
-default, and the window remembers your choice. **Copy** and **Read summary**
-use only the summary, even when thinking is visible. This is a display
-preference; it does not enable reasoning on the model.
+The Summary window keeps exposed model thinking separate from the summary.
+The **Show thinking** toolbar button reveals it while the answer streams or
+after it finishes. Thinking is hidden by default, and the window remembers
+your choice. **Copy** and **Read summary** use only the summary, even when
+thinking is visible. This is a display preference; it does not enable
+reasoning on the model or reveal reasoning a provider does not expose.
+
+Channels are normalized in the backend from provider reasoning fields,
+explicit leading reasoning blocks, or a thought channel opened by the local
+chat template. Ordinary headings and literal tokens in the answer stay
+intact. Output is limited to 1 MiB per request; exceeding the limit stops the
+summary with a recoverable error.
 
 ## Meetings
 
@@ -321,7 +326,7 @@ device such as BlackHole.
 ## Tests
 
 ```sh
-npm --prefix frontend test # Summary thinking parser (Node.js 22+)
+npm --prefix frontend test # Summary component: channels, toggle, Copy/TTS, snapshots
 zig build test            # AI client, settings, images, models
 tests/e2e.sh              # headless: select → trigger → Proofread → pasted; Playground streaming
 tests/e2e-audio.sh        # headless: captions overlay, dictation → proofread → clipboard

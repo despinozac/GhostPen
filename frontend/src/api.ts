@@ -253,9 +253,17 @@ export interface SummaryState {
   chars: number;
   message: string;
   markdown: string;
+  thinking: string;
+  revision: number;
   /** The page's readable text: the read-aloud's whole-page source. */
   page_text?: string;
 }
+export interface SummaryDelta {
+  channel: "answer" | "thinking";
+  text: string;
+  revision: number;
+}
+export type SummaryStatus = Pick<SummaryState, "state" | "title" | "chars" | "message" | "revision" | "page_text">;
 export const summaryState = () => invoke<SummaryState>("summary_state");
 /** The clipboard's text, when there is any (the summary window's prefill). */
 export const clipboardText = () => invoke<string>("clipboard_text");
